@@ -1,0 +1,194 @@
+"""工具调用协议（P2.1，§7）。
+
+默认 `TextToolCallCodec`：ReAct 式文本协议，兼容一切 OpenAI 兼容端点。
+`NativeToolCallCodec` 预留：走原生 tools= 参数，默认不启用。
+"""
+import json
+import logging
+import re
+from typing import Any, Dict, List, Optional, Protocol, Tuple
+
+from angineer_core.agent_messages import ToolCall
+from angineer_core.agent_tools import AgentTool
+
+logger = logging.getLogger(__name__)
+
+
+class ToolCallCodec(Protocol):
+    def augment_system_prompt(self, base: str, tools: List[AgentTool]) -> str:
+        ...
+
+    def parse_assistant(self, text: str) -> Tuple[str, List[ToolCall]]:
+        """返回 (纯文本部分, 工具调用列表)。空列表 = 模型没要工具 = 循环正常停。"""
+        ...
+
+
+class TextToolCallCodec:
+    """文本工具调用协议：模型输出 ```tool_calls JSON 数组``` 块。"""
+
+    def __init__(self, call_prefix: str = "call"):
+        self._call_prefix = call_prefix
+        self._seq = 0
+
+    def augment_system_prompt(self, base: str, tools: List[AgentTool]) -> str:
+        if not tools:
+            return base + (
+                "\n\n（注意：本轮工具调用已被禁用，请直接输出最终答案，"
+                "不要输出任何工具调用代码块。）"
+            )
+
+        tools_json = json.dumps(
+            [
+                {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters_schema,
+                }
+                for tool in tools
+            ],
+            ensure_ascii=False,
+            indent=2,
+        )
+        protocol = (
+            "\n\n## 工具使用协议\n"
+            "你可以调用以下工具获取证据或执行计算：\n"
+            f"{tools_json}\n\n"
+            "规则：\n"
+            "1. 需要调用工具时，只输出一个工具调用代码块，不要输出其他内容：\n"
+            '```tool_calls\n[{"name": "工具名", "arguments": {"参数名": "参数值"}}]\n```\n'
+            "2. 可以一次调用多个工具（数组内放多个对象）。\n"
+            "3. 工具结果会以「工具返回」的形式提供给你。你可以继续调用工具，或给出最终答案。\n"
+            "4. 当你掌握足够证据时，直接输出最终答案（不要包含 tool_calls 代码块）。\n"
+            "5. 禁止编造工具返回中不存在的数字与结论。\n"
+            "6. 调用工具前不要输出任何解释或引导语，直接输出工具调用代码块；工具调用块之外不要夹杂对话文字。\n"
+            "7. 最终答案不要以提问方式收尾（如「您是否想知道…」），直接给出结论后结束。"
+        )
+        # 计算纪律（2026-10-07）：FinanceBench 实测计算器 0/150 次被调用，模型全靠心算，
+        # 数值小错（如 2.1% vs 金标 1.9%）即源于此——工具清单含 calculator 时追加强制规则。
+        if any(tool.name == "calculator" for tool in tools):
+            protocol += (
+                "\n8. 计算纪律：答案中凡是需要通过运算得出的数值（差值、比值、百分比、增长率、"
+                "均值、汇总等），必须先调用 calculator 执行运算，并以工具返回结果为准；"
+                "直接从证据抄录的原始数值不需要计算。禁止心算后直接给出结果。"
+            )
+        return base + protocol
+
+    def parse_assistant(self, text: str) -> Tuple[str, List[ToolCall]]:
+        """解析 tool_calls 块；无围栏时尝试 salvage 纯 JSON 数组，避免漏进正文。"""
+        text = text or ""
+        match = re.search(r"```tool_calls\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+        if match:
+            calls = self._parse_calls_from_raw(match.group(1))
+            if calls is not None:
+                cleaned = re.sub(
+                    r"```tool_calls\s*.*?```",
+                    "",
+                    text,
+                    flags=re.DOTALL | re.IGNORECASE,
+                ).strip()
+                return cleaned, calls
+            return text, []
+        calls, span = self._salvage_plain_tool_calls(text)
+        if calls:
+            return text.replace(span, " ").strip(), calls
+        return text, []
+
+    def _parse_calls_from_raw(self, raw: str) -> Optional[List[ToolCall]]:
+        """解析 JSON 字符串为工具调用列表；非 JSON 返回 None。"""
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = self._salvage_malformed_json(raw)
+            if parsed is None:
+                return None
+        return self._parse_calls_from_value(parsed)
+
+    def _salvage_malformed_json(self, raw: str) -> Optional[Any]:
+        """宽谷修复常见畸形：模型偶发少打/多打闭合大括号（如 arguments 闭合后直接 ]）。"""
+        stripped = raw.rstrip()
+        candidates = [raw + "}" * extra for extra in (1, 2, 3)]
+        if stripped.endswith("]"):
+            # 缺失的 } 在 ] 之前（外层对象未闭合）
+            candidates.append(stripped[:-1] + "}" + stripped[-1])
+            candidates.append(stripped[:-1] + "}}" + stripped[-1])
+        for cand in candidates:
+            try:
+                return json.loads(cand)
+            except json.JSONDecodeError:
+                continue
+        # 多打闭合符/对象间杂散字符（2026-10-06 occamy 实锤 '{"arguments": {...}}}]}'
+        # 多打一个 }）：整段 loads 必败，按对象粒度 raw_decode 抢救
+        objects = self._salvage_objects(raw)
+        if objects:
+            return objects
+        return None
+
+    def _salvage_objects(self, raw: str) -> List[dict]:
+        """从残缺 JSON 文本里逐对象提取 dict（容忍对象间杂散括号/字符）。"""
+        decoder = json.JSONDecoder()
+        objects: List[dict] = []
+        i, n = 0, len(raw)
+        while i < n:
+            if raw[i] != "{":
+                i += 1
+                continue
+            try:
+                obj, end = decoder.raw_decode(raw, i)
+            except json.JSONDecodeError:
+                i += 1
+                continue
+            if isinstance(obj, dict):
+                objects.append(obj)
+            i = max(end, i + 1)
+        return objects
+
+    def _parse_calls_from_value(self, parsed: Any) -> Optional[List[ToolCall]]:
+        if not isinstance(parsed, list):
+            return None
+
+        calls: List[ToolCall] = []
+        for item in parsed:
+            if not isinstance(item, dict) or not item.get("name"):
+                continue
+            self._seq += 1
+            calls.append(
+                ToolCall(
+                    id=f"{self._call_prefix}_{self._seq}",
+                    name=str(item["name"]),
+                    arguments=item.get("arguments") if isinstance(item.get("arguments"), dict) else {},
+                )
+            )
+        return calls
+
+    def _salvage_plain_tool_calls(self, text: str) -> Tuple[Optional[List[ToolCall]], str]:
+        """无围栏时扫描 JSON 数组，识别工具调用并返回其原文片段。"""
+        decoder = json.JSONDecoder()
+        for idx, ch in enumerate(text):
+            if ch != "[":
+                continue
+            try:
+                value, end = decoder.raw_decode(text[idx:])
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(value, list):
+                continue
+            calls = self._parse_calls_from_value(value)
+            if calls:
+                return calls, text[idx : idx + end]
+        return None, ""
+
+
+class NativeToolCallCodec:
+    """原生工具调用（预留）。
+
+    走 LLM 的 tools= 参数与 message.tool_calls。默认不启用：
+    仅当某端点验证支持后按 config_name 白名单启用（R3）。
+    """
+
+    def augment_system_prompt(self, base: str, tools: List[AgentTool]) -> str:
+        return base
+
+    def parse_assistant(self, text: str) -> Tuple[str, List[ToolCall]]:
+        raise NotImplementedError(
+            "NativeToolCallCodec 预留：需端点验证 tools= 支持后按 config_name 白名单启用"
+        )

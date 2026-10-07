@@ -1,0 +1,305 @@
+"""Agent 消息模型与 LLM 边界翻译（P2.1，§6.1）。
+
+agent 侧使用轻量 dataclass；仅在 LLM 调用边界经 `to_llm_messages` 翻译为
+OpenAI 兼容格式（P7 第二道闸门）。`meta` 永不进入 LLM 上下文。
+"""
+import json
+import re
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+
+REFUSAL_ANSWER_TEXT = (
+    "没有检索到足够证据支持最终结论。"
+    "当前仅能确认已有片段与问题相关，但不足以安全地给出完整答案，请继续补充可核对的规范依据。"
+)
+
+REFUSAL_FOLLOWUP_QUESTION = "你可以补充更多规范依据或换个角度提问，需要我继续帮你分析吗？"
+
+
+REFUSAL_MARKERS = (
+    "没有检索到足够证据",   # 现话术（2026-09-20 恢复）：覆盖"检到相关片段但不足以作答"的情形
+    "未能检索到",          # 历史话术「知识库未能检索到相关答案。」（v0.2.70–v0.2.72），回放旧数据时仍在
+)
+
+# 强标记：全文任一处命中即判拒答。**不能只放模板原句**——模型不会逐字复述模板：
+# 2026-09-19 实测 39 道拒答题里 18 道漏检，起因就是模板「知识库未能检索到相关答案。」
+# 被模型写成「知识库未能检索到关于「X」的定义及其探测方法的相关答案。」——中间插进了主题，
+# 连续子串匹配整段落空（两次运行的模板原句命中数都是 0）。故只留不会因插入而失配的核心
+# 片段；以后改话术时先想清楚"模型会往里插什么"。
+#
+# 话术选择教训（2026-09-20 恢复旧话术的依据）：话术必须覆盖"检到主题相邻片段但不足以
+# 作答"的情形——检索召回提升后，不可答题也能检回一批相邻 chunk，「未能检索到相关答案」
+# 这种"什么都没检到"的措辞模型不再肯用，改写"基于证据…未提及…"式对冲回答（不含任何
+# 拒答标记），拒答题判 0。旧话术第二句「仅能确认已有片段与问题相关，但不足以安全地给出
+# 完整答案」正是给这种情形留的合法出口。
+#
+# 弱标记（中文软措辞）：**只认首个引用标记之前**的那段，且**只收语义上必然是拒答的措辞**。
+# - 只认引用之前的片段：模型自拟的拒答声明出现在引用之前（"基于提供的检索证据，无法直接回答…"），
+#   而正常作答里"此处无法确定"这类软化措辞出现在引用之后，不能当拒答。
+# - **不要收「证据不足」「信息不足」**：它们是"部分覆盖说明"这类合法回答的常用开头
+#   （2026-09-19 实踩：收进来后 test_guard_keeps_soft_partial_coverage_disclosure 立刻变红，
+#   因为 `make_final_answer_guard` 会把这种回答整段换成拒答话术）。这类软表述由
+#   `_HALF_REFUSAL_LEAD_PATTERNS` / `strip_half_refusal_lead` 那套单独处理，不走拒答判定。
+REFUSAL_LEAD_MARKERS = (
+    "无法回答",
+    "无法直接回答",
+)
+# 英文软措辞：英文回答里这些短语极少出现在正常作答中，全文匹配即可
+REFUSAL_EN_MARKERS = (
+    "cannot answer",
+    "unable to answer",
+    "does not contain",
+    "do not contain",
+)
+# 英文拒答句式（2026-10-04 occamy 关思考实测：39 道拒答题 5 道因定长短语失配漏判）。
+# 与 2026-09-19 中文教训同族——模型往短语里插字（「did not find sufficient *direct*
+# evidence」），连续子串整段落空，故用「小句窗口内骨架」正则：否定动词与 evidence
+# 必须同句（[^.\n] 截断），跨句的「未找到条款，但第 4.2 条给出了…」式部分覆盖不受误伤。
+# 误伤面与既有 "does not contain" 全文标记同类（该口径 2026-09 起已有先例）：
+# 同句宣告「没找到证据」的回答按拒答处理正是期望行为。
+REFUSAL_EN_PATTERNS = (
+    re.compile(r"(did not|do not|does not|could not|cannot|unable to)\s+(retrieve|find|locate)\b[^.\n]{0,80}evidence"),
+    re.compile(r"\bevidence\b[^.\n]{0,40}(does not|doesn't|did not|didn't)\s+(cover|contain)"),
+    re.compile(r"\bsearch[^.\n]{0,40}(returned|found|yielded)\s+no\s+evidence"),
+)
+# 降级输出（2026-10-04 同批实测 3 题）：模型把工具报错样式的 JSON 当整段答案吐出来，
+# 内容即「无证据/未调用工具」。该形态非本仓代码产生（全仓 grep "No evidence found"/
+# "No search tool was called" 均 0 命中），是模型模仿。按拒答处理：生产侧守卫换标准
+# 话术，评测侧按拒答计。只认「整段以 error JSON 开篇」的形态，正常作答引用报错样例不受影响。
+REFUSAL_ERROR_TEMPLATE_RE = re.compile(r'^```?json\s*\{\s*"error"\s*:', re.I)
+REFUSAL_LEAD_SCAN_LIMIT = 200
+
+
+def _lead_before_citation(text: str) -> str:
+    """取首个引用标记之前的片段（无引用则取前 REFUSAL_LEAD_SCAN_LIMIT 字）。"""
+    head = (text or "").strip()[:REFUSAL_LEAD_SCAN_LIMIT]
+    hit = _CITE_RE.search(head)
+    return head[: hit.start()] if hit else head
+
+
+def is_refusal_text(text: str) -> bool:
+    """判断文本是否命中拒答话术（标准话术或模型自拟变体）。"""
+    content = text or ""
+    if any(marker in content for marker in REFUSAL_MARKERS):
+        return True
+    lowered = content.lower()
+    if any(marker in lowered for marker in REFUSAL_EN_MARKERS):
+        return True
+    if any(pattern.search(lowered) for pattern in REFUSAL_EN_PATTERNS):
+        return True
+    if REFUSAL_ERROR_TEMPLATE_RE.match(content.strip()):
+        return True
+    return any(marker in _lead_before_citation(content) for marker in REFUSAL_LEAD_MARKERS)
+
+
+# 第三档拒答的协议信号（prompt 规则 16）：「以下相关信息供参考」。
+# 半协议设计（2026-09-20 方案①），后续方案②升级为结构化令牌后此信号退役。
+REFERENCE_REFUSAL_SIGNAL = "供参考"
+
+
+def is_reference_refusal(text: str) -> bool:
+    """第三档拒答：拒答开头 + 「供参考」引出的相邻片段（prompt 规则 16 的合法收尾）。
+
+    与半拒答的区别：半拒答是"先声明无证据又把答案写出来"——开头是矛盾句，剥掉留正文；
+    第三档是"核心结论无证据、相邻片段仅作线索"——整体保留，按拒答判定，
+    不剥开头（strip_half_refusal_lead 豁免）、不触发有证据拒答重试（agent_loop 豁免）。
+
+    认定靠「供参考」信号 + 拒答标记双命中，模型随手写的"供参考"不会误判
+    （无拒答标记不成立），普通拒答也不会被当成第三档（无信号不豁免）。
+    """
+    content = text or ""
+    if REFERENCE_REFUSAL_SIGNAL not in content:
+        return False
+    return is_refusal_text(content)
+
+
+# 实质拒答措辞（2026-09-27 判分口径专项）：模型不用任何拒答标记、但整段就是
+# 「证据里没有这个问题的答案」——28/39 复盘中 1 题真实措辞「检索结果中未包含关于…」，
+# 与剥头后正文同族（「并未包含关于」「并未提及」）。
+# 只配给评测判分用（answer_eval 在 refusal_expected=True 时调用）：
+# 不进 is_refusal_text、不进 guard/policy——「未提及/未包含」在合法部分覆盖里也高频
+# （「原文提到了X，但未列出具体…」），进生产判定会把部分覆盖回答误杀成拒答。
+# 因此判定面收窄到**首个引用标记之前**的开头窗口：真实拒答以缺失声明开篇，
+# 合法部分覆盖先给实质内容再补缺口（缺口句在引用之后）。
+SUBSTANTIVE_REFUSAL_PATTERNS = (
+    "未包含",      # 覆盖「并未包含」「检索结果中未包含」
+    "未提及",      # 覆盖「并未提及」
+    "未涉及",
+    "缺乏关于",
+    "未覆盖",      # 2026-10-04 run-55a16e545304 实测开篇「检索后未覆盖：知识库中没有…」
+)
+
+# 排除开篇即二元表态的回答：Yes/No 题的诱导作答（「是的，…未提及…」）不是拒答。
+# 真实实质拒答从表态开篇（实测样本首词「检索结果中」「已检索到的证据」）。
+SUBSTANTIVE_REFUSAL_AFFIRMATIVE_LEADS = ("是的", "不是", "yes", "no,")
+
+
+def is_substantive_refusal(text: str) -> bool:
+    """实质拒答：开头窗口以「证据中不存在该问题答案」式措辞开篇（无拒答标记）。
+
+    与 is_refusal_text 互补而非替代——后者认标记话术，本函数认「措辞即拒答」的
+    自发变体。**仅评测判分用**（见上方注释），生产链路（guard/回退/重试）不得调用。
+    """
+    content = text or ""
+    if not content.strip():
+        return False
+    lead = _lead_before_citation(content)
+    lowered = lead.strip().lower()
+    if lowered.startswith(SUBSTANTIVE_REFUSAL_AFFIRMATIVE_LEADS):
+        return False
+    return any(pattern in lead for pattern in SUBSTANTIVE_REFUSAL_PATTERNS)
+
+
+_HALF_REFUSAL_LEAD_PATTERNS = (
+    "证据不足",
+    "信息不足",
+    "无法确认",
+    "无法确定",
+    "不能确定",
+    "难以确定",
+    "无法给出",
+    "不能给出",
+    "缺乏足够",
+    "不足以",
+)
+
+_CITE_RE = re.compile(r"\[[KTE]\d+\]")
+
+
+def is_half_refusal_text(text: str, max_len: int = 400) -> bool:
+    """识别“半拒答”：开头先声明证据不足，随后又带着引用标记继续作答。
+
+    判定条件（全部满足）：
+    - 文本开头 max_len 字符内出现证据不足类变体短语；
+    - 全文出现引用标记（说明后续仍在基于检索作答）；
+    - 全文长度明显大于一句拒答说明（>120 字符）。
+    """
+    content = (text or "").strip()
+    if len(content) <= 120:
+        return False
+    lead = content[:max_len]
+    if not any(pattern in lead for pattern in _HALF_REFUSAL_LEAD_PATTERNS):
+        return False
+    if not _CITE_RE.search(content):
+        return False
+    return True
+
+
+def strip_half_refusal_lead(text: str) -> str:
+    """半拒答删掉开头那句硬拒答声明，保留后面带引用的正文。
+
+    门槛自持（不复用 is_half_refusal_text）：那条软表述关键词表里没有硬拒答话术
+    （REFUSAL_MARKERS 的子串），用它做门槛会导致真正要修的场景不触发（单测实踩）。
+    只认硬拒答标记 + 后文有引用：「证据不足/部分未覆盖」这类软表述是 prompt 要求
+    模型如实说明的部分覆盖提示，属于合法回答，不动。
+
+    豁免：第三档拒答（is_reference_refusal，拒答开头+「供参考」相邻片段）是 prompt
+    规则 16 的合法收尾——剥掉开头会让它失去拒答标记、被评测当成幻觉作答（判 0）。
+    """
+    content = (text or "").strip()
+    if is_reference_refusal(content):
+        return content
+    if len(content) <= 120 or not _CITE_RE.search(content):
+        return content
+    if not any(marker in content[:400] for marker in REFUSAL_MARKERS):
+        return content
+    for idx, ch in enumerate(content[:400]):
+        if ch in "。！？\n":
+            tail = content[idx + 1:].strip()
+            if tail:
+                return tail
+            break
+    return content
+
+
+@dataclass
+class ToolCall:
+    """循环侧生成的工具调用。id 形如 call_{turn}_{seq}。"""
+
+    id: str
+    name: str
+    arguments: Dict[str, Any]
+
+
+@dataclass
+class AgentMessage:
+    """agent 侧统一消息。"""
+
+    role: str  # "user" | "assistant" | "tool" | "system"
+    content: str = ""
+    tool_calls: List[ToolCall] = field(default_factory=list)
+    tool_call_id: Optional[str] = None  # role="tool" 时回指
+    name: Optional[str] = None  # role="tool" 时的工具名
+    is_error: bool = False
+    meta: Dict[str, Any] = field(default_factory=dict)  # citations/timings，不下发 LLM
+
+
+def agent_message_to_dict(message: AgentMessage) -> Dict[str, Any]:
+    """序列化为可 JSON 化的字典（用于事件/run_end，不含 meta）。"""
+    data: Dict[str, Any] = {"role": message.role, "content": message.content}
+    if message.tool_calls:
+        data["tool_calls"] = [
+            {"id": call.id, "name": call.name, "arguments": call.arguments}
+            for call in message.tool_calls
+        ]
+    if message.tool_call_id:
+        data["tool_call_id"] = message.tool_call_id
+    if message.name:
+        data["name"] = message.name
+    if message.is_error:
+        data["is_error"] = True
+    return data
+
+
+def to_llm_messages(
+    messages: List[AgentMessage],
+    tool_style: str = "text",
+) -> List[Dict[str, Any]]:
+    """翻译为 OpenAI 兼容消息。
+
+    tool_style:
+      - "text"：工具结果包装为 role="user"（文本协议，由 codec 决定）；
+      - "native"：工具结果保留 role="tool"，assistant 消息携带 tool_calls。
+    """
+    llm_messages: List[Dict[str, Any]] = []
+    for message in messages:
+        role = message.role
+        if role == "user":
+            llm_messages.append({"role": "user", "content": message.content})
+        elif role == "system":
+            llm_messages.append({"role": "system", "content": message.content})
+        elif role == "assistant":
+            entry: Dict[str, Any] = {"role": "assistant", "content": message.content}
+            if tool_style == "native" and message.tool_calls:
+                entry["tool_calls"] = [
+                    {
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": json.dumps(call.arguments, ensure_ascii=False),
+                        },
+                    }
+                    for call in message.tool_calls
+                ]
+            llm_messages.append(entry)
+        elif role == "tool":
+            if tool_style == "native":
+                llm_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": message.tool_call_id or "",
+                        "content": message.content,
+                    }
+                )
+            else:
+                label = f"[工具 {message.name or 'unknown'} 返回"
+                if message.is_error:
+                    label += "（错误）"
+                label += "]"
+                llm_messages.append({"role": "user", "content": f"{label}\n{message.content}"})
+        else:
+            # 未知角色兜底为 user，避免协议级崩溃
+            llm_messages.append({"role": "user", "content": message.content})
+    return llm_messages

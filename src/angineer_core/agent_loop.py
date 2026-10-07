@@ -1,0 +1,1642 @@
+"""无状态 agent 循环原语（P2，§6.4 / P2.2）。
+
+边界：本模块只允许依赖 agent_messages / agent_events / agent_tools /
+tool_codec / contracts，禁止反向依赖 dispatcher / classifier / memory。
+"""
+from __future__ import annotations
+
+import json
+import functools
+import logging
+import os
+import queue
+import re
+import threading
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+
+from angineer_core.agent_events import AgentEvent
+from angineer_core.agent_messages import (
+    AgentMessage,
+    REFUSAL_ANSWER_TEXT,
+    REFUSAL_FOLLOWUP_QUESTION,
+    ToolCall,
+    agent_message_to_dict,
+    is_reference_refusal,
+    is_refusal_text,
+    to_llm_messages,
+)
+from angineer_core.agent_tools import AgentTool, ToolResult
+from angineer_core.tool_codec import NativeToolCallCodec, TextToolCallCodec
+
+logger = logging.getLogger(__name__)
+
+
+# 文本工具协议下模型会把 ```tool_calls [...]```（或裸 "tool_calls [...]"）写进正文流。
+# 流式期间必须增量识别并抑制该段，否则工具调用 JSON 会经 message_delta 泄漏到前端
+# （剥离只发生在 turn 结束后对已落库 full_text 做，前端已收到的 delta 无法回收）。
+_TOOL_FENCE_START_RE = re.compile(r"(?:```\s*)?tool_calls\s*[\r\n]?\s*\[", re.IGNORECASE)
+_TOOL_FENCE_HOLD_RE = re.compile(r"(?:```\s*)?tool_calls\s*$", re.IGNORECASE)
+_TOOL_FENCE_PREFIXES = ("```tool_calls", "tool_calls")
+# 整块剥离（终答守卫用）：从围栏起点到闭合 ```（或文本末尾——流截断时围栏可能未闭合）
+_TOOL_FENCE_BLOCK_RE = re.compile(r"(?:```\s*)?tool_calls\s*\[.*?(?:```|$)", re.DOTALL | re.IGNORECASE)
+
+
+class _DeltaFenceFilter:
+    """流式过滤 tool_calls 段：返回应转发给前端的文本，围栏内内容不转发。
+
+    - 开始标记：```tool_calls[ 或裸 tool_calls[（允许空白/换行），可跨 delta 切分；
+      marker 已完整出现但尚未看到 [ 时保持 hold，等后续 delta 确认；
+    - 带 ``` 围栏时检测到结束 ``` 后恢复转发（围栏后可能有尾随正文）；
+    - 裸格式无可靠结束标记，抑制到本轮结束。
+    """
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._suppress = False
+        self._fenced = False
+
+    def feed(self, delta: str) -> str:
+        if self._suppress:
+            self._buf += delta
+            if self._fenced:
+                end = self._buf.find("```")
+                if end >= 0:
+                    rest = self._buf[end + 3:]
+                    self._buf = ""
+                    self._suppress = False
+                    self._fenced = False
+                    return self.feed(rest)
+            return ""
+        self._buf += delta
+        match = _TOOL_FENCE_START_RE.search(self._buf)
+        if match:
+            out = self._buf[: match.start()]
+            self._buf = self._buf[match.end():]
+            self._suppress = True
+            self._fenced = match.group(0).lstrip().startswith("```")
+            if self._fenced and "```" in self._buf:
+                end = self._buf.find("```")
+                rest = self._buf[end + 3:]
+                self._buf = ""
+                self._suppress = False
+                self._fenced = False
+                return out + self.feed(rest)
+            return out
+        # marker 已完整出现、等待确认是否紧跟 [：保持 hold
+        hold = _TOOL_FENCE_HOLD_RE.search(self._buf)
+        if hold:
+            out = self._buf[: hold.start()]
+            self._buf = self._buf[hold.start():]
+            return out
+        keep = self._prefix_tail_len(self._buf)
+        out = self._buf[:-keep] if keep else self._buf
+        self._buf = self._buf[-keep:] if keep else ""
+        return out
+
+    def flush(self) -> str:
+        """流结束时收尾：正常状态下残留的缓冲转发出去；suppress 状态下丢弃围栏残余。"""
+        if self._suppress:
+            self._buf = ""
+            return ""
+        out = self._buf
+        self._buf = ""
+        return out
+
+    @classmethod
+    def _prefix_tail_len(cls, text: str) -> int:
+        """text 的后缀是某开始标记的前缀时，返回该后缀长度（跨 delta 切分保护）。"""
+        low = text.lower()
+        best = 0
+        for prefix in _TOOL_FENCE_PREFIXES:
+            max_k = min(len(prefix) - 1, len(low))
+            for k in range(1, max_k + 1):
+                if prefix.startswith(low[-k:]) and k > best:
+                    best = k
+        return best
+
+
+@dataclass
+class TurnContext:
+    """turn 边界决策上下文。"""
+
+    turn: int
+    messages: List[AgentMessage]
+    tool_results: List[ToolResult]
+    usage: Dict[str, Any]
+
+
+@dataclass
+class AttemptConfig:
+    """引擎内的一段执行：工具集/提示词/轮数由 config_factory 提供。"""
+
+    name: str
+    config_factory: Callable[[], AgentLoopConfig]
+    success_check: Optional[Callable[[List[AgentMessage]], bool]] = None
+    fallback_note: str = ""
+    requires_tools: bool = False  # True 时禁止“不调工具直接作答”，强制至少一轮工具调用
+    force_first_search: bool = False  # True 时段 apply 后立即成对注入一次检索（需求 C）
+    first_search_tool: str = "knowledge_search"  # 注入用工具：L1=正文检索，L2=table_search（计划①）
+
+
+@dataclass
+class AgentLoopConfig:
+    # —— 模型出口（循环只认 LLMProvider Protocol，不认厂商）——
+    llm: Any  # 满足 contracts.LLMProvider
+    model: Optional[str] = None
+    config_name: Optional[str] = None
+    mode: str = "instruct"
+    max_tokens: Optional[int] = None
+    # —— 行为 ——
+    tools: List[AgentTool] = field(default_factory=list)
+    system_prompt: str = ""
+    codec: Any = None  # ToolCallCodec，默认 TextToolCallCodec
+    max_turns: int = 3
+    # —— 分段（attempt）执行 ——
+    attempts: List[AttemptConfig] = field(default_factory=list)
+    # —— 闸门与决策点（全部可选回调）——
+    transform_context: Optional[Callable[[List[AgentMessage]], List[AgentMessage]]] = None
+    should_stop_after_turn: Optional[Callable[[TurnContext], bool]] = None
+    before_tool_call: Optional[Callable[[AgentTool, Dict], Optional[str]]] = None
+    after_tool_call: Optional[Callable[[ToolResult], ToolResult]] = None
+    final_answer_guard: Optional[
+        Callable[[List[AgentMessage]], Optional[Tuple[Optional[str], Optional[str]]]]
+    ] = None
+    route_note: Optional[str] = None
+    # 「意图判断」步耗时（=分类耗时，思考过程标签用；2026-09-27）
+    route_note_ms: Optional[int] = None
+    tool_timeout_s: int = 120
+    # 首字存活线（秒）：首字前挂起超该时长即放弃拉流并抛错收口；0=禁用。
+    # 未显式传时走环境变量（见 _first_token_liveness_default，默认 90s）。
+    first_token_liveness_s: float = -1.0
+    followup_question: Optional[bool] = None
+    pending_messages_provider: Optional[Callable[[], List[AgentMessage]]] = None
+    # 被吞掉的 LLM 失败落点（哨兵 b）：调用方传入列表即可回收"降级继续跑"的失败明细，
+    # 评测据此区分"校准过的拒答"与"故障吞错式拒答"（2026-09-06 53 题全灭事故驱动）
+    error_sink: Optional[List[str]] = None
+
+
+def _first_token_liveness_default() -> float:
+    """ANGINEER_FIRST_TOKEN_LIVENESS_S：首字存活线默认秒数，0=禁用。默认 90s。
+
+    90s 取值依据：生产网关 proxy_read_timeout 600s 之下、read 超时 600s 之下，
+    正常首字 p99 < 60s（llm_turn 打点）；挂起时 90s 收口，用户不会等满 10 分钟。
+    非法值回退默认（fail-open 不拖垮启动）。
+    """
+    raw = os.getenv("ANGINEER_FIRST_TOKEN_LIVENESS_S", "90").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning("ANGINEER_FIRST_TOKEN_LIVENESS_S 非法值 %r，按默认 90 处理", raw)
+        return 90.0
+
+
+def _iter_with_liveness(
+    source_iter: Iterator[Dict[str, Any]],
+    limit_s: float,
+    cancel: Optional[threading.Event] = None,
+    cancel_wait: float = 0.15,
+):
+    """给 LLM 流换线程拉流，套两条退出维度：
+
+    - 首字存活线（limit_s>0 时）：首字前挂起超该时长即放弃拉流并抛错；
+    - cancel（传入时）：等待期每 cancel_wait 秒检查一次，设位即静默收口。
+
+    为什么必须换线程拉流：阻塞在 stream.__next__() 时，httpx read 超时与循环里的
+    cancel 检查都碰不到它（2026-10-04 squad2 实锤：连接活着但上游永不回数据，
+    一题卡死 90 分钟；main.py:564 注释同实——客户端 abort 只断开连接）。
+    首字之后的生成段间隙由 read 超时（600s）管，不属此域。
+
+    挂起被收口时拉流线程显式放弃并 close 源 generator（触发 ai-inference 侧
+    finally 关 HTTP 响应），挂起线程随连接关闭解阻塞后静默退出。
+    limit_s<=0 时只保留 cancel 维度（存活线禁用 ≠ 挂起不可打断）。
+    """
+    out: queue.Queue = queue.Queue(maxsize=256)
+    _stop = threading.Event()
+
+    def _pull() -> None:
+        while not _stop.is_set():
+            try:
+                item = next(source_iter)
+            except StopIteration:
+                _put(("end", None))
+                return
+            except BaseException as exc:  # noqa: BLE001 —— 异常经队列回传消费线程再抛
+                _put(("err", exc))
+                return
+            if not _put(("item", item)):
+                return  # 消费方已放弃
+
+    def _put(msg) -> bool:
+        # 有界队列 + 退出感知：消费方收口后无人再取，阻塞 put 会让拉流线程永驻
+        while not _stop.is_set():
+            try:
+                out.put(msg, timeout=0.2)
+                return True
+            except queue.Full:
+                continue
+        # 被放弃：close 源 generator，触发 ai-inference 侧 finally（HTTP 响应关闭、
+        # 熔断记账），挂起线程随连接关闭解阻塞后静默退出
+        try:
+            source_iter.close()  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+    threading.Thread(target=_pull, daemon=True).start()
+    deadline = time.monotonic() + limit_s if limit_s and limit_s > 0 else None
+    # 薄壳 generator：消费方 break/GeneratorExit（cancel、异常、done 后早退）时
+    # finally 置 _stop，拉流线程才会退出——否则有界队列满后它永驻
+    def _drain():
+        # got_first 局部于 _drain（nonlocal 会被外层先读后用——UnboundLocalError 实踩）
+        got_first = False
+        try:
+            while True:
+                try:
+                    kind, payload = out.get(timeout=cancel_wait if cancel is not None else 1.0)
+                except queue.Empty:
+                    if cancel is not None and cancel.is_set():
+                        # 停止按钮：等待期响应收到约 0.15s（此前 __next__ 阻塞期 cancel 完全不可达）
+                        return
+                    if deadline is not None and not got_first and time.monotonic() >= deadline:
+                        raise RuntimeError(
+                            f"模型首字前挂起（{limit_s:.0f}s 无任何返回），已放弃本轮拉流"
+                        )
+                    continue
+                if kind == "item":
+                    if payload.get("type") == "delta" and (payload.get("text") or ""):
+                        got_first = True
+                    yield payload
+                elif kind == "err":
+                    raise payload
+                else:
+                    return
+        finally:
+            _stop.set()
+
+    yield from _drain()
+
+
+def _safe_emit(emit: Optional[Callable[[AgentEvent], None]], event: AgentEvent) -> None:
+    """事件出口绝不因回调异常炸掉循环。"""
+    if emit is None:
+        return
+    try:
+        emit(event)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("emit 回调异常（已忽略）: %s", exc)
+
+
+def _run_callback(callback, default, *args):
+    """回调异常一律 fail-open（视为未设置/不拦截）并记 warning。"""
+    if callback is None:
+        return default
+    try:
+        return callback(*args)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("agent 回调异常，按未设置处理: %s", exc)
+        return default
+
+
+def _tool_evidence_present(messages: List[AgentMessage]) -> bool:
+    """工具返回中是否存在非空证据文本（items[].text）。"""
+    for message in messages:
+        if message.role != "tool" or message.is_error:
+            continue
+        try:
+            raw = json.loads(message.content or "{}")
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(raw, dict):
+            continue
+        for item in raw.get("items") or []:
+            if isinstance(item, dict) and str(item.get("text") or "").strip():
+                return True
+    return False
+
+
+def _last_answer_is_hard_refusal(messages: List[AgentMessage]) -> bool:
+    """拒答且非第三档（「供参考」相邻片段）——第三档是 prompt 规则 16 的合法收尾，
+    触发定向重试会逼模型把相邻证据改写成答案，正是 2026-09-20 nightly 拒答题
+    24/39→18/39 的失守路径。"""
+    for message in reversed(messages):
+        if message.role == "assistant" and not message.tool_calls:
+            content = message.content or ""
+            return is_refusal_text(content) and not is_reference_refusal(content)
+    return False
+
+
+# 循环自身注入的 user 角色提示（不是用户真实提问）——代检索取 query 时必须跳过。
+# 踩坑（2026-09-11 生产/开发同时复现）：取「第一条 user 消息」在多轮会话里会拿开场白
+# （如「你好」）去检索 → 命中 0 条 → 误判无证据 → 用户看到「没有检索到足够证据」拒答。
+_INJECTED_USER_PROMPTS = (
+    "请先调用检索工具获取证据后再回答",
+    "已代为执行知识检索，请基于检索到的证据给出最终答案",
+    "已检索到有效证据",
+    "上一段未命中，进入下一段：",
+    "轮次预算已用完，请基于已有证据直接给出最终答案",
+)
+
+
+def _latest_user_query(messages: List[AgentMessage]) -> str:
+    """取最近一条用户真实提问（跳过循环注入的提示与空消息）。"""
+    for message in reversed(messages):
+        if message.role != "user":
+            continue
+        content = (message.content or "").strip()
+        if not content or content.startswith(_INJECTED_USER_PROMPTS):
+            continue
+        return content
+    return ""
+
+
+def _tool_evidence_parts(
+    messages: List[AgentMessage], max_items: int = 3, max_chars_per_item: int = 800
+) -> List[str]:
+    """摘出工具返回里的证据原文节选，供拒答后的定向重试回喂（避免模型再次空口拒答）。"""
+    parts: List[str] = []
+    for message in messages:
+        if message.role != "tool" or message.is_error:
+            continue
+        try:
+            raw = json.loads(message.content or "{}")
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(raw, dict):
+            continue
+        for item in raw.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text") or "").strip()
+            if not text:
+                continue
+            parts.append(text[:max_chars_per_item])
+            if len(parts) >= max_items:
+                return parts
+    return parts
+
+
+def _force_retrieve_tool(
+    messages: List[AgentMessage],
+    machine: "_AttemptMachine",
+    emit: Optional[Callable[[AgentEvent], None]],
+    run_id: str,
+    cancel: threading.Event,
+) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """代检索保险：段要求工具但模型始终未调用、且重试额度已用尽时，系统替它执行 knowledge_search。
+
+    触发条件见 advance()（requires_tools && !used_tools && retry_used），
+    不判定最终答案是否拒答；绕开模型输出工具调用格式不稳定的问题，
+    直接把检索结果注入对话（仅 tool 消息，无 assistant 调用配对——
+    这是收尾保险路径，与需求 C 的成对注入不同）。
+    返回 (工具结果文本, 原始载荷 raw)；失败或工具不存在时返回 None（保持原收尾逻辑）。
+    raw 必须随行：装配侧把它挂进 tool 消息 meta，policy_query 的 retrieved_items/citations
+    提取只读 meta——只回传文本会让检索实际成功却被评测判成 retrieval_miss_doc
+    （2026-10-01 FinanceBench run-77b37dd521d2 JnJ 题实踩）。
+    """
+    query = _latest_user_query(messages)
+    if not query:
+        return None
+    tool = machine.tools_by_name.get("knowledge_search")
+    if tool is None:
+        return None
+    call = ToolCall(id="forced_knowledge_search", name="knowledge_search", arguments={"query": query})
+    try:
+        results = _execute_tools_batch(
+            [call], machine.tools_by_name, machine.active_config, cancel, emit, run_id,
+            machine.current_turn or 0,
+        )
+        if not results:
+            return None
+        result = results[0]
+        raw = result.raw if isinstance(result.raw, dict) else {}
+        return result.content, raw
+    except Exception:  # noqa: BLE001
+        logger.warning("代检索保险执行失败，按原逻辑收尾", exc_info=True)
+        return None
+
+
+def _validate_arguments(schema: Dict[str, Any], arguments: Dict[str, Any]) -> Optional[str]:
+    try:
+        import jsonschema
+
+        jsonschema.validate(instance=arguments, schema=schema or {"type": "object", "properties": {}})
+        return None
+    except Exception as exc:  # noqa: BLE001
+        return str(exc)
+
+
+def _json_content(value: Dict[str, Any]) -> str:
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _llm_evidence_dedup_enabled() -> bool:
+    """需求 B 回退开关（plan-ttft-improvement §7）：默认开，设 0/false/off 可关。"""
+    return os.environ.get("ANGINEER_LLM_EVIDENCE_DEDUP", "1").strip().lower() not in ("0", "false", "off")
+
+
+def _llm_shell_strip_enabled() -> bool:
+    """投影 V2 回退开关：剥 items[] 检索器遥测外壳（正文才是模型要读的），默认开，设 0 回退。"""
+    return os.environ.get("ANGINEER_LLM_SHELL_STRIP", "1").strip().lower() not in ("0", "false", "off")
+
+
+# LLM 投影 items[] 白名单：模型作答/引用需要的最小面。
+#   text 正文、cite 引用号（规则 17 依赖）、title/doc_title 出处、
+#   rerank_score 相关性分（证据相关性标注链依赖）、page_label 页码（引用展示）。
+#   引擎判定只读 text（_tool_evidence_present/_tool_evidence_parts）；
+#   retrieval_policy/fusion_*/table_* 等检索器遥测走 raw/meta 通道供评测（policy_query 读 message.meta），不进 prompt。
+_LLM_ITEM_KEEP_KEYS = ("text", "title", "doc_title", "cite", "rerank_score", "page_label")
+
+
+def _project_items(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """items[] 逐条投影：只留白名单键（metadata 里的 cite/page_label 提升到顶层）。
+
+    实测（2026-10-05 生产 chat.sqlite 40 条 tool result）：正文占 29%、外壳占 53%——
+    外壳里的 rerank_score 以 relevance 标签进 text 顶层，metadata 副本对模型是纯重复。
+    非 dict 条目原样保留（防御未知工具形态）；无 text 键的条目原样保留（表格/实体形态不猜结构）。
+    """
+    items = payload.get("items")
+    if not isinstance(items, list):
+        return payload
+    projected = []
+    for item in items:
+        if not isinstance(item, dict) or "text" not in item:
+            projected.append(item)
+            continue
+        meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        slim: Dict[str, Any] = {}
+        for key in _LLM_ITEM_KEEP_KEYS:
+            if key in item:
+                slim[key] = item[key]
+        for key in ("cite", "page_label"):
+            if key in meta and key not in slim:
+                slim[key] = meta[key]
+        projected.append(slim)
+    out = dict(payload)
+    out["items"] = projected
+    return out
+
+
+def _force_first_search_enabled() -> bool:
+    """需求 C 回退开关：L1 段首轮直达证据注入，默认开，设 0/false/off 可关。"""
+    return os.environ.get("ANGINEER_FORCE_FIRST_SEARCH", "1").strip().lower() not in ("0", "false", "off")
+
+
+def _inject_followup_chars() -> int:
+    """跟进式提问判定阈值（§8.6）：当前消息字数 ≤ 阈值视为跟进式，注入前做上下文化改写。
+    默认 15；设 0 关闭改写。"""
+    try:
+        return int(os.environ.get("ANGINEER_INJECT_FOLLOWUP_CHARS", "15"))
+    except ValueError:
+        return 15
+
+
+def _contextualize_followup_query(messages: List[AgentMessage], query: str) -> str:
+    """跟进式短问（「想知道」「可以继续问么」）原文无检索实体，按原文注入必检回
+    无关证据、白烧检索+一轮 LLM（2026-09-25 生产实测）。阈值内且有上文真实提问时，
+    用「上一问，当前问」合成检索 query；上文只取真实用户提问（跳过循环注入的内部
+    user 提示与空消息），最近一条真实提问即当前消息本身，需再往前取一条。
+    """
+    limit = _inject_followup_chars()
+    if limit <= 0 or not (0 < len(query) <= limit):
+        return query
+    prev = ""
+    skipped_current = False
+    for message in reversed(messages):
+        if message.role != "user":
+            continue
+        content = (message.content or "").strip()
+        if not content or content.startswith(_INJECTED_USER_PROMPTS):
+            continue
+        if not skipped_current:
+            skipped_current = True
+            continue
+        prev = content
+        break
+    if not prev:
+        return query
+    return f"{prev}，{query}"
+
+
+def _llm_content_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """LLM 序列化投影（需求 B）：content 剔除 evidences[]——它与 items[] 全文重复、
+    同一份证据进 prompt 两遍（evidences 由 items 一一构造，agent_tools.py:196-220）。
+
+    方向写死「删 evidences 留 items」：引擎判定（_has_evidence/_tool_evidence_present/
+    _tool_evidence_parts）与前端引用/思考轨迹全部解析 content 里的 items/citations；
+    raw（meta 通道）原样保留给评测（policy_query 读 message.meta）。
+
+    私有键（"_" 前缀，如 _prefetch_ms 预检耗时）一律不进 LLM 投影：只走 raw/meta 通道
+    供链路展示，避免内部观测字段混进提示词（2026-09-30）。
+    """
+    payload = {key: value for key, value in raw.items() if not str(key).startswith("_")}
+    if _llm_evidence_dedup_enabled():
+        payload = {key: value for key, value in payload.items() if key != "evidences"}
+    if _llm_shell_strip_enabled() and "items" in payload:
+        payload = _project_items(payload)
+    return payload
+
+
+@functools.lru_cache(maxsize=512)
+def _handler_takes_cancel(handler: Any) -> bool:
+    """handler 是否显式声明 cancel_event 形参（**kwargs 吞掉不算——会静默丢失取消信号）。"""
+    try:
+        import inspect
+
+        return "cancel_event" in inspect.signature(handler).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _run_tool_inner(call, tool: AgentTool, cancel_event: Optional[threading.Event] = None) -> ToolResult:
+    try:
+        # 剥掉下划线私有键：模型幻觉出的 "_from_speculative" 之类不得触碰内部路径
+        raw_args = {k: v for k, v in (call.arguments or {}).items() if not str(k).startswith("_")}
+        if cancel_event is not None and _handler_takes_cancel(tool.handler):
+            raw_args.setdefault("cancel_event", cancel_event)
+        raw = tool.handler(**raw_args)
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {"result": raw}
+        raw = dict(raw)
+        terminate = bool(raw.pop("terminate", False))
+        return ToolResult(
+            call_id=call.id,
+            name=tool.name,
+            content=_json_content(_llm_content_payload(raw)),
+            is_error=bool(raw.get("error")),
+            terminate=terminate,
+            raw=raw,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return ToolResult(
+            call_id=call.id,
+            name=tool.name,
+            content=f"工具执行失败: {exc}",
+            is_error=True,
+        )
+
+
+def _timeout_result(call, tool: AgentTool, timeout: int) -> ToolResult:
+    return ToolResult(
+        call_id=call.id,
+        name=tool.name,
+        content=f"工具 {tool.name} 执行超时（{timeout}s）；线程未杀死（如实记录限制）",
+        is_error=True,
+    )
+
+
+def _execute_tools_batch(
+    calls: List,
+    tools_by_name: Dict[str, AgentTool],
+    config: AgentLoopConfig,
+    cancel: threading.Event,
+    emit: Optional[Callable[[AgentEvent], None]],
+    run_id: str,
+    turn: int,
+    injected: bool = False,
+) -> List[ToolResult]:
+    """工具三阶段：prepare（查找/schema 校验/before 钩子）→ execute → finalize。
+
+    injected=True：本批是「首轮直达」预检索（后端替模型先跑），事件带标记
+    供前端把该步显示为「预检索」而非「模型调用工具」（2026-09-30，归属不误导）。
+    """
+    results: List[ToolResult] = []
+    pending: List[Tuple] = []
+    _injected_flag: Dict[str, Any] = {"injected": True} if injected else {}
+
+    def _reused_flag(result: ToolResult) -> Dict[str, Any]:
+        """memo 复用标注：reused_ms=预检真实耗时（「并行预检 X.Xs」，2026-09-30）；
+        waited_ms=主路等待预检时长（「等待预检 X.Xs」，F3 在途等待，2026-10-03）。"""
+        raw = getattr(result, "raw", None)
+
+        def _int(v) -> int:
+            try:
+                return int(v) if v is not None else 0
+            except (TypeError, ValueError):
+                return 0
+
+        flag: Dict[str, Any] = {}
+        if isinstance(raw, dict):
+            ms = _int(raw.get("_prefetch_ms"))
+            waited = _int(raw.get("_memo_wait_ms"))
+            if ms > 0:
+                flag["reused_ms"] = ms
+            if waited > 0:
+                flag["waited_ms"] = waited
+        return flag
+
+    def _ops_record_tool(name: str, dur_ms: int, is_error: bool) -> None:
+        # 分段观测（req-intent-classify-latency §1 口径勘误）：ttft 内部构成拆解需要工具段耗时
+        from angineer_core.ops_metrics import record_event
+
+        record_event("tool", {"run_id": run_id, "turn": turn, "tool": name, "dur_ms": dur_ms, "is_error": is_error})
+
+    def fail(call, message: str) -> ToolResult:
+        _safe_emit(
+            emit,
+            AgentEvent(type="tool_start", run_id=run_id, turn=turn, payload={"call_id": call.id, "name": call.name, "args": call.arguments, **_injected_flag}),
+        )
+        result = ToolResult(call_id=call.id, name=call.name, content=message, is_error=True)
+        _safe_emit(
+            emit,
+            AgentEvent(type="tool_end", run_id=run_id, turn=turn, payload={"call_id": call.id, "name": call.name, "is_error": True, "duration_ms": 0, "result": message[:300], **_injected_flag}),
+        )
+        _ops_record_tool(call.name, 0, True)
+        return result
+
+    for call in calls:
+        tool = tools_by_name.get(call.name)
+        if tool is None:
+            results.append(fail(call, f"工具未注册: {call.name}"))
+            continue
+        validation_error = _validate_arguments(tool.parameters_schema, call.arguments)
+        if validation_error:
+            results.append(fail(call, f"参数校验失败: {validation_error}"))
+            continue
+        block_reason = _run_callback(config.before_tool_call, None, tool, call.arguments)
+        if block_reason:
+            results.append(fail(call, f"工具调用被拦截: {block_reason}"))
+            continue
+        pending.append((call, tool))
+
+    if cancel.is_set():
+        # 取消发生在执行前：仍然补发 tool_start/tool_end 和错误结果，
+        # 保证思考过程能看到"已取消（未执行）"这一步。
+        for call, _tool in pending:
+            results.append(fail(call, "工具调用已取消（未执行）"))
+        return [_run_callback(config.after_tool_call, result, result) for result in results]
+    if not pending:
+        return [_run_callback(config.after_tool_call, result, result) for result in results]
+
+    timeout = max(1, config.tool_timeout_s or 120)
+    sequential = any(tool.execution_mode == "sequential" for _, tool in pending)
+    executor = ThreadPoolExecutor(max_workers=1 if sequential else min(len(pending), 8))
+
+    def _submit_with_context(call, tool):
+        # contextvars 不随 ThreadPoolExecutor.submit 传播（不同于 asyncio.to_thread）：
+        # 显式复制当前上下文提交，工具线程内的深层打点（ops run_id 等）才能读到。
+        # 每次 submit 复制一份——同一个 Context 对象不可并发 run。
+        # cancel 一并传入：声明了 cancel_event 形参的 handler（如 knowledge_search 的
+        # memo 在途等待）可提前退出，不必烧满 tool_timeout（F3，2026-10-03）。
+        import contextvars
+
+        return executor.submit(contextvars.copy_context().run, _run_tool_inner, call, tool, cancel)
+
+    try:
+        for call, tool in pending:
+            _safe_emit(
+                emit,
+                AgentEvent(type="tool_start", run_id=run_id, turn=turn, payload={"call_id": call.id, "name": tool.name, "args": call.arguments, **_injected_flag}),
+            )
+
+        if sequential:
+            for call, tool in pending:
+                if cancel.is_set():
+                    break
+                started = time.monotonic()
+                future = _submit_with_context(call, tool)
+                try:
+                    result = future.result(timeout=timeout)
+                except FuturesTimeoutError:
+                    result = _timeout_result(call, tool, timeout)
+                results.append(result)
+                _dur_ms = int((time.monotonic() - started) * 1000)
+                _safe_emit(
+                    emit,
+                    AgentEvent(type="tool_end", run_id=run_id, turn=turn, payload={"call_id": call.id, "name": tool.name, "is_error": result.is_error, "duration_ms": _dur_ms, "result": result.content[:300], **_reused_flag(result), **_injected_flag}),
+                )
+                _ops_record_tool(tool.name, _dur_ms, result.is_error)
+        else:
+            futures = {_submit_with_context(call, tool): (call, tool) for call, tool in pending}
+            for future, (call, tool) in futures.items():
+                started = time.monotonic()
+                try:
+                    result = future.result(timeout=timeout)
+                except FuturesTimeoutError:
+                    result = _timeout_result(call, tool, timeout)
+                    # 超时后立即放弃等待；剩余 future 由 shutdown(cancel_futures=True) 取消/泄漏
+                results.append(result)
+                _dur_ms = int((time.monotonic() - started) * 1000)
+                _safe_emit(
+                    emit,
+                    AgentEvent(type="tool_end", run_id=run_id, turn=turn, payload={"call_id": call.id, "name": tool.name, "is_error": result.is_error, "duration_ms": _dur_ms, "result": result.content[:300], **_reused_flag(result), **_injected_flag}),
+                )
+                _ops_record_tool(tool.name, _dur_ms, result.is_error)
+    finally:
+        # 关键：禁止 with ThreadPoolExecutor（默认 shutdown(wait=True) 会阻塞到线程跑完）
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    # finalize：after_tool_call 补丁（异常 fail-open）
+    return [_run_callback(config.after_tool_call, result, result) for result in results]
+
+
+def _run_llm_turn(
+    messages: List[AgentMessage],
+    new_prompt_messages: List[AgentMessage],
+    config: AgentLoopConfig,
+    codec,
+    tools_by_name: Dict[str, AgentTool],
+    emit: Optional[Callable[[AgentEvent], None]],
+    run_id: str,
+    cancel: threading.Event,
+    turn: int,
+    allow_tools: bool,
+    run_started: Optional[float] = None,
+) -> Tuple[AgentMessage, List, List[ToolResult], Dict[str, Any]]:
+    """执行一轮 LLM 调用。
+
+    返回 (assistant 消息, 待执行工具调用, 直接结果（截断守卫产物）, usage)。
+    """
+    for message in new_prompt_messages:
+        _safe_emit(emit, AgentEvent(type="message_start", run_id=run_id, turn=turn, payload={}))
+        _safe_emit(emit, AgentEvent(type="message_end", run_id=run_id, turn=turn, payload={}))
+
+    # 闸门一：transform_context（异常视为未设置）
+    transformed = _run_callback(config.transform_context, messages, messages)
+    if not isinstance(transformed, list):
+        transformed = messages
+
+    tool_style = "native" if isinstance(codec, NativeToolCallCodec) else "text"
+    llm_messages = [
+        {"role": "system", "content": codec.augment_system_prompt(config.system_prompt, config.tools if allow_tools else [])}
+    ]
+    llm_messages.extend(to_llm_messages(transformed, tool_style=tool_style))
+
+    _safe_emit(emit, AgentEvent(type="message_start", run_id=run_id, turn=turn, payload={}))
+    full_text = ""
+    finish_reason = None
+    usage: Dict[str, Any] = {}
+    fence_filter = _DeltaFenceFilter()
+    _turn_t0 = time.monotonic()
+    _turn_first_delta_at: Optional[float] = None
+    _liveness_s = (
+        config.first_token_liveness_s
+        if config.first_token_liveness_s >= 0
+        else _first_token_liveness_default()
+    )
+    try:
+        _raw_stream = config.llm.chat_stream_events(
+            llm_messages,
+            model=config.model,
+            mode=config.mode,
+            config_name=config.config_name,
+            max_tokens=config.max_tokens,
+        )
+        for event in _iter_with_liveness(iter(_raw_stream), _liveness_s, cancel):
+            if cancel.is_set():
+                # cancel 期间不再消费剩余帧；拉流线程随 generator 关闭而退出。
+                # 挂起时退出点：done 路径即时 / cancel 检查 1s / 存活线（首字前挂起）。
+                break
+            if event.get("type") == "delta":
+                delta = event.get("text") or ""
+                full_text += delta
+                visible = fence_filter.feed(delta)
+                if visible:
+                    if _turn_first_delta_at is None:
+                        _turn_first_delta_at = time.monotonic()
+                    _safe_emit(emit, AgentEvent(type="message_delta", run_id=run_id, turn=turn, payload={"delta": visible}))
+            elif event.get("type") == "done":
+                finish_reason = event.get("finish_reason")
+                if event.get("usage"):
+                    usage = dict(event["usage"])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("LLM 流式调用异常: %s", exc)
+        finish_reason = finish_reason or "error"
+        if config.error_sink is not None:
+            # 吞错继续降级，但把失败原文交给调用方留痕（评测哨兵 b）
+            config.error_sink.append(f"turn{turn} LLM 流式调用异常: {str(exc)[:300]}")
+    tail = fence_filter.flush()
+    if tail:
+        _safe_emit(emit, AgentEvent(type="message_delta", run_id=run_id, turn=turn, payload={"delta": tail}))
+
+    # 解析工具调用（解析失败 fail-open 到纯文本答案）
+    calls: List = []
+    try:
+        _, calls = codec.parse_assistant(full_text)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("codec 解析失败，按纯文本答案处理: %s", exc)
+        calls = []
+
+    # 泄漏守卫（2026-10-06 occamy 实锤：'{"arguments": {...}}}]}』多打一个 } 抢救失败，
+    # 整段 tool JSON 被当最终答案上桌，判官 0 分）：围栏在而调用解析全败时，
+    # 围栏外有正文 → 剥围栏放行；围栏外无正文 → 走下方喂回通道逼模型重新作答。
+    fence_unparsed = not calls and bool(_TOOL_FENCE_START_RE.search(full_text or ""))
+    if fence_unparsed:
+        full_text = _TOOL_FENCE_BLOCK_RE.sub(" ", full_text).strip()
+    elif not allow_tools and calls:
+        # 禁工具轮（requires_tools 收尾段）：调用不会被下游执行，剥掉围栏只留正文
+        full_text = _TOOL_FENCE_BLOCK_RE.sub(" ", full_text).strip() or full_text
+
+    has_tool_calls = bool(calls)
+    _turn_dur_ms = int((time.monotonic() - _turn_t0) * 1000)
+    _turn_first_delta_ms = int((_turn_first_delta_at - _turn_t0) * 1000) if _turn_first_delta_at is not None else None
+    # 本轮 TTFT：run 起点 → 本轮首 token（单轮=答案首字延迟；多轮含前面各轮；2026-09-30）
+    _turn_run_ttft_ms = (
+        int((_turn_first_delta_at - run_started) * 1000)
+        if (_turn_first_delta_at is not None and run_started is not None) else None
+    )
+    _turn_prompt_tokens = usage.get("prompt_tokens")
+    _turn_completion_tokens = usage.get("completion_tokens")
+    # 分段观测（req-intent-classify-latency §1 口径勘误）：逐 LLM 轮记录耗时/首 delta/prompt，
+    # 与 kind=tool 记录按 run_id+turn 关联，即可拆出 ttft 内部构成（检索/重试/prefill 各占多少）。
+    try:
+        from angineer_core.ops_metrics import record_event
+
+        record_event(
+            "llm_turn",
+            {
+                "run_id": run_id,
+                "turn": turn,
+                "dur_ms": _turn_dur_ms,
+                "first_delta_ms": _turn_first_delta_ms,
+                "prompt_tokens": _turn_prompt_tokens,
+                "completion_tokens": _turn_completion_tokens,
+                "has_tool_calls": has_tool_calls,
+                "finish_reason": finish_reason,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    # 思考过程「模型调用」步（2026-09-30 B 档）：把每轮 LLM 的内部构成作为 note 事件下发——
+    # 数据本就在 llm_turn 打点里，此前只落 ops JSONL 不进链路。
+    # 文案口径（09-30 用户实测"29.5s 感受不到包含什么"后细化）：本步总时长只走 duration_ms
+    # （渲染为前置时间 tag），正文给构成——「等待 Xs（prefill/首字）＋生成 Ys（流式输出）」
+    # ＋输出/prompt tokens＋是否决定调工具；用「等待/生成」而非「首字」，避免与收尾便签的
+    # run 级首字同词重复（09-30 实拍困惑）。
+    try:
+        # 分行为段（2026-09-30 用户指定版式）：首行标题，其后每段一行——
+        #   5.0s 等待（含排队与预填充；prompt N tokens）
+        #   13.7s 输出 M tokens（≈R tok/s）
+        # 说明：预填充与排队在本侧不可分（网关不回报 per-request prefill 用时），合并在「等待」行；
+        # 要拆开需 DGX/网关侧按请求暴露 prefill 指标。
+        _turn_lines: List[str] = []
+        _gen_ms: Optional[int] = None
+        if _turn_first_delta_ms is not None:
+            _gen_ms = max(_turn_dur_ms - _turn_first_delta_ms, 0)
+            _wait_desc = f"{_turn_first_delta_ms / 1000:.1f}s 等待（含排队与预填充"
+            if _turn_prompt_tokens:
+                _wait_desc += f"；prompt {_turn_prompt_tokens} tokens"
+            _wait_desc += "）"
+            _turn_lines.append(_wait_desc)
+        if _gen_ms is not None:
+            _out_desc = f"{_gen_ms / 1000:.1f}s 输出"
+            if _turn_completion_tokens:
+                _out_desc += f" {_turn_completion_tokens} tokens"
+                if _gen_ms > 0:
+                    _out_desc += f"（≈{_turn_completion_tokens / (_gen_ms / 1000):.0f} tok/s）"
+            if _turn_run_ttft_ms is not None:
+                _out_desc += f"，TTFT={_turn_run_ttft_ms / 1000:.1f}s"
+            _turn_lines.append(_out_desc)
+        elif _turn_completion_tokens:
+            _turn_lines.append(f"输出 {_turn_completion_tokens} tokens")
+        if has_tool_calls:
+            _turn_lines.append("本轮决定调用工具")
+        if _turn_lines:
+            _turn_label = f"模型调用（第 {turn} 轮）：" + chr(10) + chr(10).join(_turn_lines)
+        else:
+            _turn_label = f"模型调用（第 {turn} 轮）"
+        _safe_emit(
+            emit,
+            AgentEvent(
+                type="note",
+                run_id=run_id,
+                turn=turn,
+                payload={
+                    "detail": _turn_label,
+                    "duration_ms": _turn_dur_ms,
+                    "first_delta_ms": _turn_first_delta_ms,
+                    "prompt_tokens": _turn_prompt_tokens,
+                    "has_tool_calls": has_tool_calls,
+                },
+            ),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    _safe_emit(
+        emit,
+        AgentEvent(type="message_end", run_id=run_id, turn=turn, payload={"finish_reason": finish_reason, "has_tool_calls": has_tool_calls}),
+    )
+
+    assistant = AgentMessage(role="assistant", content=full_text, tool_calls=calls)
+    direct_results: List[ToolResult] = []
+
+    # 泄漏守卫喂回：整条输出只有一个解析不了的 tool_calls 块 → 伪造工具错误结果，
+    # 逼模型直接作答（复用 P5 截断守卫的 direct_results 通道，受 max_turns 上限约束）
+    if fence_unparsed and not full_text.strip():
+        direct_results.append(
+            ToolResult(
+                call_id=f"call_{turn}_fence_unparsed",
+                name="",
+                content=(
+                    "检测到无法解析的工具调用块（JSON 畸形或输出被截断），本次调用未执行。"
+                    "请直接给出最终答案；如需计算，重新发起规范的 tool_calls 调用，"
+                    "不要在最终答案中夹杂工具调用文本。"
+                ),
+                is_error=True,
+            )
+        )
+        return assistant, [], direct_results, usage
+
+    # 截断守卫（P5）：finish_reason == "length" 时本轮 tool_calls 全部作废
+    if finish_reason == "length":
+        if calls:
+            for call in calls:
+                direct_results.append(
+                    ToolResult(
+                        call_id=call.id,
+                        name=call.name,
+                        content="输出被长度截断，参数可能不完整，请重新发起调用",
+                        is_error=True,
+                    )
+                )
+        else:
+            direct_results.append(
+                ToolResult(
+                    call_id=f"call_{turn}_truncated",
+                    name="",
+                    content="输出被长度截断，请基于已有内容直接给出最终答案",
+                    is_error=True,
+                )
+            )
+        return assistant, [], direct_results, usage
+
+    return assistant, calls, [], usage
+
+
+class _AttemptMachine:
+    """attempt 分段状态机：应用段配置、判定段结果、fallback/retry/拒答收尾。
+
+    状态全部显式持有（替代原先的 nonlocal 共享），事件出口通过注入的 add_note。
+    """
+
+    def __init__(
+        self,
+        config: AgentLoopConfig,
+        messages: List[AgentMessage],
+        start_idx: int,
+        add_note: Callable[[str], None],
+    ) -> None:
+        self.base_config = config
+        self.attempts = list(config.attempts or [])
+        self.messages = messages
+        self.start_idx = start_idx
+        self.attempt_start_idx = start_idx
+        self.add_note = add_note
+        self.active_config = config
+        self.active_attempt_idx = -1
+        self.attempt_turn = 0
+        self.retry_used = False
+        self.refusal_retry_used = False
+        self._forced_retrieve_used = False
+        # 观测标注（零行为影响）：final_outcome=最终答案来源的终态枚举，
+        # path_trace=按序经历的中间分支；跨段累积（apply 不重置），随 run_end 落盘。
+        self.final_outcome: Optional[str] = None
+        self.path_trace: List[str] = []
+        # 判分口径豁免（2026-09-27）：半拒答剥头前的原文，仅 half_refusal_stripped 时有值；
+        # 随 run_end 上浮供评测按原文判拒答（剥头只算展示层行为）。
+        self.answer_pre_strip: Optional[str] = None
+        self.force_retrieve: Optional[Callable[[], Optional[Tuple[str, Dict[str, Any]]]]] = None
+        self.first_search_injector: Optional[Callable[[], None]] = None
+        self.current_turn = 0
+        self.codec = config.codec or TextToolCallCodec()
+        self.tools_by_name = {tool.name: tool for tool in config.tools}
+
+    def start(self) -> None:
+        if not self.attempts:
+            return
+        # 顺序纪律（2026-09-30）：先报处理链路，再 apply——apply 会触发首轮直达
+        # 预检索（发出工具事件），否则时间线上「检索」跑在「计划」前面，看着像没计划就开跑。
+        # 单段链路不报（2026-09-30 用户实拍）：与「意图判断」行的策略名重复、信息量≈0；
+        # 多段才报——它的价值是预告「走不通会自动升级」。
+        if len(self.attempts) > 1:
+            self.add_note(
+                "处理链路：" + " → ".join(a.name for a in self.attempts) + "（前段未命中自动回退）"
+            )
+        self.apply(0)
+
+    def apply(self, index: int) -> None:
+        """应用第 index 段的完整可覆盖字段；codec 随段刷新。"""
+        self.active_attempt_idx = index
+        self.attempt_start_idx = len(self.messages)
+        self.retry_used = False
+        self.refusal_retry_used = False
+        self._forced_retrieve_used = False
+        nested = self.attempts[index].config_factory()
+        active = replace(
+            self.base_config,
+            llm=nested.llm,
+            model=nested.model,
+            config_name=nested.config_name,
+            mode=nested.mode,
+            max_tokens=nested.max_tokens,
+            tools=nested.tools,
+            system_prompt=nested.system_prompt,
+            max_turns=nested.max_turns,
+            codec=nested.codec or self.base_config.codec,
+            final_answer_guard=nested.final_answer_guard,
+            transform_context=nested.transform_context,
+            should_stop_after_turn=nested.should_stop_after_turn,
+            tool_timeout_s=nested.tool_timeout_s,
+            followup_question=nested.followup_question,
+            pending_messages_provider=nested.pending_messages_provider or self.base_config.pending_messages_provider,
+        )
+        self.codec = active.codec or TextToolCallCodec()
+        self.active_config = active
+        self.tools_by_name = {tool.name: tool for tool in active.tools}
+        # 需求 C：段配置就位后立即注入首轮直达证据（仅挂了 force_first_search 的段）
+        if (
+            getattr(self.attempts[index], "force_first_search", False)
+            and self.first_search_injector is not None
+        ):
+            self.first_search_injector()
+
+    def _refusal_text(self) -> str:
+        if getattr(self.active_config, "followup_question", False):
+            return REFUSAL_ANSWER_TEXT + REFUSAL_FOLLOWUP_QUESTION
+        return REFUSAL_ANSWER_TEXT
+
+    def advance(self) -> str:
+        """当前段成功→"completed"；失败且有下一段→切换并返回 "next"；
+        需要工具但未调用→返回 "retry"（最多一次）；有证据却拒答→终段定向重试（最多一次）；
+        否则 "exhausted"。"""
+        added = self.messages[self.start_idx:]
+        attempt = self.attempts[self.active_attempt_idx]
+        check = attempt.success_check
+        used_tools = any(m.role == "tool" for m in self.messages[self.attempt_start_idx:])
+        ok = check is None or bool(_run_callback(check, True, added))
+        if ok:
+            if not (attempt.requires_tools and not used_tools):
+                self.final_outcome = "model_answer"
+                return "completed"
+        if attempt.requires_tools and not used_tools:
+            if not self.retry_used:
+                self.retry_used = True
+                # 腾出一轮带工具的预算：这次“直接作答”不计入轮次预算
+                self.attempt_turn = max(0, self.attempt_turn - 1)
+                self.messages.append(AgentMessage(role="user", content="请先调用检索工具获取证据后再回答"))
+                self.add_note("未调用检索工具，已要求重新检索后回答")
+                self.path_trace.append("no_tool_retry")
+                return "retry"
+            # 代检索保险：仍不调工具且最终答案是拒答时，替模型执行 knowledge_search 再答一轮
+            if (
+                self.force_retrieve is not None
+                and not self._forced_retrieve_used
+            ):
+                forced = self.force_retrieve()
+                if forced:
+                    result_content, result_raw = forced
+                    self._forced_retrieve_used = True
+                    self.attempt_turn = max(0, self.attempt_turn - 1)
+                    self.messages.append(
+                        AgentMessage(
+                            role="tool",
+                            content=result_content,
+                            tool_call_id="forced_knowledge_search",
+                            name="knowledge_search",
+                            meta=result_raw,
+                        )
+                    )
+                    self.messages.append(
+                        AgentMessage(
+                            role="user",
+                            content="已代为执行知识检索，请基于检索到的证据给出最终答案；"
+                            "若证据只覆盖部分内容，请回答已支持的部分并说明缺失项，不要整体拒答。",
+                        )
+                    )
+                    self.add_note("最终回答为拒答且未调用检索工具，已代为执行 knowledge_search 并要求基于证据重答")
+                    self.path_trace.append("forced_retrieve")
+                    return "retry"
+            return self._finalize_no_tool_answer(added)
+        if (
+            not ok
+            and used_tools
+            and self.active_attempt_idx + 1 >= len(self.attempts)
+            and not self.refusal_retry_used
+            and _tool_evidence_present(self.messages[self.attempt_start_idx:])
+            and _last_answer_is_hard_refusal(self.messages[self.attempt_start_idx:])
+        ):
+            self.refusal_retry_used = True
+            # 定向重试不占本轮预算
+            self.attempt_turn = max(0, self.attempt_turn - 1)
+            evidence_parts = _tool_evidence_parts(self.messages[self.attempt_start_idx:])
+            retry_prompt = (
+                "已检索到有效证据，请基于证据作答；若证据只覆盖部分内容，"
+                "请回答已支持的部分并明确说明缺失项，不要整体拒答。"
+            )
+            if evidence_parts:
+                # 回喂证据原文节选：小模型常把"请基于证据作答"这类空指令当耳旁风，重新给出原文才肯作答
+                retry_prompt = (
+                    "以下为已检索到的证据节选：\n"
+                    + "\n---\n".join(evidence_parts)
+                    + f"\n\n{retry_prompt}"
+                )
+            self.messages.append(AgentMessage(role="user", content=retry_prompt))
+            self.add_note(
+                "有有效证据但回答为拒答，已要求基于证据重答"
+                + (f"（附证据节选 {len(evidence_parts)} 条）" if evidence_parts else "")
+            )
+            self.path_trace.append("refusal_retry")
+            return "retry"
+        if self.active_attempt_idx + 1 < len(self.attempts):
+            nxt = self.attempts[self.active_attempt_idx + 1]
+            self.add_note(attempt.fallback_note or f"本段未命中，进入下一段：{nxt.name}")
+            self.messages.append(AgentMessage(role="user", content=f"上一段未命中，进入下一段：{nxt.name}"))
+            self.apply(self.active_attempt_idx + 1)
+            self.attempt_turn = 0
+            self.path_trace.append("fallback_next")
+            return "next"
+        return self._finalize_no_tool_answer(added)
+
+    def _finalize_no_tool_answer(self, added: List[AgentMessage]) -> str:
+        """requires_tools 重试后仍不调工具：保留非空最终答案，空答案才补拒答。"""
+        final_answer = next(
+            (
+                m for m in reversed(added)
+                if m.role == "assistant" and not m.tool_calls and (m.content or "").strip()
+            ),
+            None,
+        )
+        if final_answer is not None:
+            self.final_outcome = (
+                "model_refusal_kept" if is_refusal_text(final_answer.content or "") else "model_answer"
+            )
+            return "completed"
+        return "exhausted"
+
+    def finalize_refusal(self) -> str:
+        """终段没有产出任何答案时，补一条拒答并以 completed 收尾，避免前端无结果。"""
+        self.messages.append(AgentMessage(role="assistant", content=self._refusal_text()))
+        self.add_note("未产生可用答案，已按拒答收尾")
+        self.final_outcome = "finalized_refusal"
+        return "completed"
+
+
+def _apply_final_guard(
+    config: AgentLoopConfig,
+    messages: List[AgentMessage],
+    start_idx: int,
+    emit: Optional[Callable[[AgentEvent], None]],
+    run_id: str,
+    turn: int,
+    add_note: Callable[[str], None],
+) -> Optional[str]:
+    """最终答案边界（P6c）：guard 自行区分检索过/未检索。
+
+    返回 guard 的机器可读结果码（无 guard/未处理返回 None），供观测标注
+    （final_outcome 的 guard_replaced_* / model_answer_stripped 类终态）。
+    """
+    added_messages = messages[start_idx:]
+    final_assistant = next(
+        (m for m in reversed(added_messages) if m.role == "assistant" and not m.tool_calls),
+        None,
+    )
+    if final_assistant is None:
+        return None
+    guard_result = _run_callback(config.final_answer_guard, None, added_messages)
+    if not guard_result:
+        return None
+    if len(guard_result) == 3:
+        new_content, guard_note, guard_code = guard_result
+    else:
+        new_content, guard_note = guard_result
+        guard_code = None
+    if guard_note:
+        add_note(guard_note)
+    if new_content is not None and new_content != final_assistant.content:
+        final_assistant.content = new_content
+        _safe_emit(
+            emit,
+            AgentEvent(
+                type="answer",
+                run_id=run_id,
+                turn=turn,
+                payload={"content": new_content},
+            ),
+        )
+    return guard_code
+
+
+def run_agent_loop(
+    messages: List[AgentMessage],
+    config: AgentLoopConfig,
+    emit: Optional[Callable[[AgentEvent], None]] = None,
+    cancel: Optional[threading.Event] = None,
+    run_id: Optional[str] = None,
+    pending_messages_provider: Optional[Callable[[], List[AgentMessage]]] = None,
+) -> List[AgentMessage]:
+    """执行 agent 循环，就地追加消息，返回本 run 新增的消息。"""
+    run_id = run_id or uuid.uuid4().hex[:12]
+    # ops 观测关联键：本 run 深层打点（工具/检索分段）经 contextvar 自动带上 run_id
+    from angineer_core.ops_metrics import set_run_id
+
+    set_run_id(run_id)
+    cancel_event = cancel if cancel is not None else threading.Event()
+    provider = pending_messages_provider if pending_messages_provider is not None else config.pending_messages_provider
+    start_idx = len(messages)
+    turn = 0
+    total_usage: Dict[str, Any] = {}
+    reason = "completed"
+    trace_notes: List[Dict[str, Any]] = []
+
+    # TTFT 打点（plan-ttft-improvement §6.5）：run_start → 最终答案轮首 message_delta。
+    # total_usage 逐轮覆盖同 key（只有末轮口径），故 usage 与首 delta 时刻都按 turn 逐轮记账。
+    run_started = time.monotonic()
+    first_delta_at: Dict[int, float] = {}
+    turn_usage: Dict[int, Dict[str, Any]] = {}
+    assistant_turns: List[int] = []  # 本 run 第 i 条 LLM 产出的 assistant 消息对应的 turn
+    # 末轮 LLM 结束时刻：收尾便签（生成完成）的耗时标签＝从那之后到 run 结束的增量（guard+终态），
+    # 不再是 run 总耗时——否则与折叠头「总耗时」重复、违背「本步耗时」的标签语义（用户 2026-09-30 实拍）
+    last_turn_end_at: Optional[float] = None
+
+    raw_emit = emit
+
+    def _tracked_emit(event: AgentEvent) -> None:
+        if event.type == "message_delta":
+            first_delta_at.setdefault(event.turn, time.monotonic())
+        _safe_emit(raw_emit, event)
+
+    emit = _tracked_emit
+
+    def _add_note(
+        detail: str,
+        duration_ms: Optional[int] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """记录一条可见的边界/过程说明，实时事件与 run_end 都会带上。
+
+        duration_ms：本步耗时（结构化，供思考过程每步耗时标签；2026-09-27）。
+        extra：附加结构化字段（如 ttft_ms；2026-09-30 B 档），随 payload 下发。"""
+        fields: Dict[str, Any] = {"detail": detail}
+        if duration_ms:
+            fields["duration_ms"] = int(duration_ms)
+        if extra:
+            fields.update(extra)
+        trace_notes.append(fields)
+        _safe_emit(
+            emit,
+            AgentEvent(type="note", run_id=run_id, turn=turn, payload=dict(fields)),
+        )
+
+    _safe_emit(emit, AgentEvent(type="run_start", run_id=run_id, turn=0, payload={}))
+    if config.route_note:
+        _add_note(config.route_note, duration_ms=config.route_note_ms)
+
+    # —— 分段（attempt）初始化 ——
+    machine = _AttemptMachine(config, messages, start_idx, _add_note)
+    machine.force_retrieve = lambda: _force_retrieve_tool(messages, machine, emit, run_id, cancel_event)
+
+    def _inject_first_search() -> None:
+        """需求 C（plan-ttft-improvement）：段 apply 后、首个 LLM turn 前，
+        替模型执行一次检索并把「assistant 工具调用 + tool 结果」成对注入——
+        消灭「首轮空答 → 重试要求调工具 → 再检索」的多余 LLM 轮
+        （实测该模式 turns=3、ttft 25-35s；注入后预期 turns=1~2）。
+        工具按段配置：L1=knowledge_search，L2=table_search（计划①，2026-09-26）。
+
+        必须成对注入：buildThinkingTrace 按 call/result 配对，只注 tool 会错位。
+        注入后本段 used_tools=True，requires_tools 重试/代检索自然成为死路径。
+        检索失败（is_error/异常）不注入：保留模型自行换词重试的活路。
+        """
+        if not _force_first_search_enabled():
+            return
+        attempt = machine.attempts[machine.active_attempt_idx]
+        if not getattr(attempt, "force_first_search", False):
+            return
+        # 计划①：注入工具按段配置——L1=knowledge_search（正文），L2=table_search（表格/条款）
+        tool_name = getattr(attempt, "first_search_tool", "knowledge_search") or "knowledge_search"
+        if machine.tools_by_name.get(tool_name) is None:
+            return
+        if start_idx > 0 and messages[start_idx - 1].role == "user":
+            query = (messages[start_idx - 1].content or "").strip()
+        else:
+            query = (_latest_user_query(messages) or "").strip()
+        if not query:
+            return
+        # §8.6：跟进式短问的注入 query 上下文化（上文真实提问 + 当前消息）
+        original_query = query
+        query = _contextualize_followup_query(messages, query)
+        call = ToolCall(id="call_0_injected_search", name=tool_name, arguments={"query": query})
+        try:
+            results = _execute_tools_batch(
+                [call], machine.tools_by_name, machine.active_config, cancel_event, emit, run_id, 0,
+                injected=True,
+            )
+        except Exception:  # noqa: BLE001
+            return
+        if not results or results[0].is_error:
+            return
+        result = results[0]
+        fence = (
+            "```tool_calls\n"
+            + json.dumps([{"name": tool_name, "arguments": {"query": query}}], ensure_ascii=False)
+            + "\n```"
+        )
+        messages.append(AgentMessage(role="assistant", content=fence, tool_calls=[call], meta={"injected_tool_call": True}))
+        messages.append(
+            AgentMessage(
+                role="tool",
+                content=result.content,
+                tool_call_id=result.call_id,
+                name=result.name,
+                is_error=result.is_error,
+                meta=result.raw,
+            )
+        )
+        # 并入上一对工具步显示（attach=pair，2026-09-30）：第 3 步「预检索」已有耗时即代表完成，
+        # 单独再出「预检索完成」一步是冗余（用户实拍）；此便签改为挂在预检索步下的附注行。
+        _add_note(
+            f"证据已提前查好并放进上下文（{tool_name}）——模型首轮即可直接作答，"
+            "省去「先申请检索」的一轮空转"
+            + ("；跟进式提问，已结合上一问改写检索词" if query != original_query else ""),
+            extra={"attach": "pair"},
+        )
+        machine.path_trace.append("first_search_injected")
+
+    machine.first_search_injector = _inject_first_search
+    machine.start()
+
+    try:
+        if cancel_event.is_set():
+            reason = "cancelled"
+            _add_note("用户取消，停止生成")
+        else:
+            prev_len = start_idx
+            while True:
+                # 决策点：steer 注入 / should_stop / cancel / max_turns
+                if provider is not None:
+                    pending = _run_callback(provider, [])
+                    if pending:
+                        messages.extend(pending)
+
+                if turn > 0:
+                    turn_context = TurnContext(turn=turn, messages=messages, tool_results=[], usage=total_usage)
+                    if _run_callback(machine.active_config.should_stop_after_turn, False, turn_context):
+                        reason = "should_stop"
+                        _add_note("上下文预算超阈值，停止继续调用工具（should_stop）")
+                        break
+                    if cancel_event.is_set():
+                        reason = "cancelled"
+                        _add_note("用户取消，停止生成")
+                        break
+                    budget = machine.active_config.max_turns if machine.attempts else config.max_turns
+                    if machine.attempt_turn >= budget:
+                        # 段预算耗尽：不硬断，追加预算提示后给最后一次无工具收尾 turn
+                        _add_note(
+                            f"轮次预算已用完（max_turns={budget}），进入无工具收尾回答"
+                        )
+                        machine.path_trace.append("budget_exhausted")
+                        messages.append(
+                            AgentMessage(role="user", content="轮次预算已用完，请基于已有证据直接给出最终答案")
+                        )
+                        new_prompt = messages[prev_len:]
+                        prev_len = len(messages)
+                        turn += 1
+                        machine.attempt_turn += 1
+                        machine.current_turn = turn
+                        _safe_emit(emit, AgentEvent(type="turn_start", run_id=run_id, turn=turn, payload={"turn": turn}))
+                        assistant, _, direct_results, usage = _run_llm_turn(
+                            messages, new_prompt, machine.active_config, machine.codec, machine.tools_by_name,
+                            emit, run_id, cancel_event, turn, allow_tools=False, run_started=run_started,
+                        )
+                        last_turn_end_at = time.monotonic()
+                        messages.append(assistant)
+                        assistant_turns.append(turn)
+                        if usage:
+                            total_usage.update(usage)
+                            turn_usage[turn] = dict(usage)
+                        for result in direct_results:
+                            messages.append(
+                                AgentMessage(role="tool", content=result.content, tool_call_id=result.call_id, name=result.name, is_error=result.is_error)
+                            )
+                        _safe_emit(emit, AgentEvent(type="turn_end", run_id=run_id, turn=turn, payload={"turn": turn, "tool_results": []}))
+                        if machine.attempts:
+                            status = machine.advance()
+                            if status == "next":
+                                continue
+                            if status in ("exhausted", "retry"):
+                                reason = machine.finalize_refusal()
+                            break  # completed / exhausted 均已收尾，reason 已维护
+                        reason = "max_turns"
+                        break
+
+                turn += 1
+                machine.attempt_turn += 1
+                machine.current_turn = turn
+                _safe_emit(emit, AgentEvent(type="turn_start", run_id=run_id, turn=turn, payload={"turn": turn}))
+                new_prompt = messages[prev_len:]
+                prev_len = len(messages)
+
+                assistant, calls, direct_results, usage = _run_llm_turn(
+                    messages, new_prompt, machine.active_config, machine.codec, machine.tools_by_name,
+                    emit, run_id, cancel_event, turn, allow_tools=True, run_started=run_started,
+                )
+                last_turn_end_at = time.monotonic()
+                messages.append(assistant)
+                assistant_turns.append(turn)
+                if usage:
+                    total_usage.update(usage)
+                    turn_usage[turn] = dict(usage)
+
+                if direct_results:
+                    # 截断守卫产物：直接作为工具结果喂回，不执行任何工具
+                    _add_note("输出被长度截断（finish_reason=length），本轮工具调用已作废")
+                    for result in direct_results:
+                        messages.append(
+                            AgentMessage(role="tool", content=result.content, tool_call_id=result.call_id, name=result.name, is_error=result.is_error)
+                        )
+                    _safe_emit(
+                        emit,
+                        AgentEvent(type="turn_end", run_id=run_id, turn=turn, payload={"turn": turn, "tool_results": [_tool_summary(r) for r in direct_results]}),
+                    )
+                    continue
+
+                if calls:
+                    tool_results = _execute_tools_batch(
+                        calls, machine.tools_by_name, machine.active_config, cancel_event, emit, run_id, turn,
+                    )
+                    for result in tool_results:
+                        messages.append(
+                            AgentMessage(role="tool", content=result.content, tool_call_id=result.call_id, name=result.name, is_error=result.is_error, meta=result.raw)
+                        )
+                    _safe_emit(
+                        emit,
+                        AgentEvent(type="turn_end", run_id=run_id, turn=turn, payload={"turn": turn, "tool_results": [_tool_summary(r) for r in tool_results]}),
+                    )
+                    if tool_results and all(result.terminate for result in tool_results):
+                        reason = "terminated"
+                        _add_note("工具返回终止信号，提前结束（terminate）")
+                        break
+                    continue
+
+                # 无工具调用：模型主动给出最终答案，正常停
+                _safe_emit(emit, AgentEvent(type="turn_end", run_id=run_id, turn=turn, payload={"turn": turn, "tool_results": []}))
+                if machine.attempts:
+                    status = machine.advance()
+                    if status == "next":
+                        continue
+                    if status == "retry":
+                        continue  # 已追加“请先调用检索工具”的用户消息，下一轮带工具重试
+                    if status == "exhausted":
+                        reason = machine.finalize_refusal()
+                        break
+                reason = "completed"
+                break
+    except Exception as exc:  # noqa: BLE001
+        reason = "error"
+        logger.exception("agent 循环致命错误")
+        _safe_emit(
+            emit,
+            AgentEvent(type="error", run_id=run_id, turn=turn, payload={"message": str(exc), "stage": "run_agent_loop"}),
+        )
+
+    # 最终答案边界（P6c）：guard 自行区分检索过/未检索。
+    # 有工具结果时做证据拒答 + 标记校验；没有工具结果时仍执行标记清理
+    # （模型未调工具却输出 [Kx] 视为编造）。L0 闲聊档不装 guard，不受影响。
+    guard_code = None
+    if reason not in ("error", "cancelled"):
+        # 判分口径豁免：guard 会就地改写最终 assistant 正文，先留存剥头前原文
+        _pre_guard_answer = next(
+            (
+                m.content
+                for m in reversed(messages[start_idx:])
+                if m.role == "assistant" and not m.tool_calls
+            ),
+            None,
+        )
+        guard_code = _apply_final_guard(machine.active_config, messages, start_idx, emit, run_id, turn, _add_note)
+        # 观测标注：guard 结果修正 final_outcome（替换类覆盖、保留类补齐、清理类只记 path）
+        if guard_code == "no_evidence":
+            machine.final_outcome = "guard_replaced_no_evidence"
+        elif guard_code == "unsupported_reference":
+            machine.final_outcome = "guard_replaced_unsupported_ref"
+        elif guard_code == "tool_error_json":
+            machine.final_outcome = "guard_replaced_tool_error"
+        elif guard_code == "half_refusal_stripped":
+            machine.final_outcome = "model_answer_stripped"
+            machine.answer_pre_strip = _pre_guard_answer
+        elif guard_code == "refusal_kept":
+            if machine.final_outcome not in ("model_refusal_kept", "finalized_refusal"):
+                machine.final_outcome = "model_refusal_kept"
+        elif guard_code == "markers_cleaned":
+            machine.path_trace.append("markers_cleaned")
+        elif guard_code == "answer_envelope_unwrapped":
+            # 拆封是形态改写（内文照常走证据/拒答校验），只记路径不动 final_outcome
+            machine.path_trace.append("answer_envelope_unwrapped")
+    # 无 attempts 的裸 config（纯直答）不走 advance，补齐终态保证枚举完备
+    if machine.final_outcome is None and reason == "completed":
+        machine.final_outcome = "model_answer"
+
+    ttft_ms, final_prompt_tokens = _final_turn_metrics(
+        messages[start_idx:], assistant_turns, first_delta_at, turn_usage, run_started,
+    )
+    logger.info(
+        "agent run TTFT: run_id=%s reason=%s turns=%d ttft_ms=%s final_turn_prompt_tokens=%s",
+        run_id,
+        reason,
+        turn,
+        ttft_ms if ttft_ms is not None else "-",
+        final_prompt_tokens if final_prompt_tokens is not None else "-",
+    )
+    # 观测落盘（需求 §4 修正）：容器日志随重建清零，TTFT 验收口径以 data/ops/ JSONL 为准
+    from angineer_core.ops_metrics import record_event
+
+    record_event(
+        "ttft",
+        {
+            "run_id": run_id,
+            "reason": reason,
+            "turns": turn,
+            "ttft_ms": ttft_ms,
+            "final_turn_prompt_tokens": final_prompt_tokens,
+        },
+    )
+
+    # 思考过程收尾便签（2026-09-27 引入，2026-09-30 收敛）：只在该便签有独立信息时才出。
+    # - 无首字（拒答收尾轮/模型吐空）：必出（只给收尾耗时并注明，防"无归属"）。
+    # - 多轮：出——run 级首字（含前面各轮 LLM）与任何单轮的「等待」都不同，是独立信息。
+    # - 单轮且收尾段有实耗（≥50ms，如 LLM 级 guard 改写）：出，只报收尾段。
+    # - 单轮且收尾≈0：不出——首字/耗时已由「意图判断→预检索→模型调用（等待＋生成）」各步与
+    #   折叠头总耗时覆盖，整条属重复（2026-09-30 用户实拍：与「模型调用」复述）。
+    if reason not in ("error", "cancelled"):
+        _total_ms = int((time.monotonic() - run_started) * 1000)
+        # 收尾段耗时（guard + 终态收尾）：标签口径＝本步增量，区别于折叠头的 run 总耗时
+        _tail_ms = int((time.monotonic() - (last_turn_end_at or run_started)) * 1000)
+        if ttft_ms is None:
+            _add_note("生成结束：本轮未产出首字（按边界规则收尾）", duration_ms=_tail_ms)
+        elif _tail_ms >= 50:
+            _add_note(
+                "生成完成：边界校验与收尾",
+                duration_ms=_tail_ms,
+                # 结构化 TTFT（B 档）：随 payload 下发供链路展示/观测
+                extra={"ttft_ms": int(ttft_ms), "turns": turn, "total_ms": _total_ms},
+            )
+        # 其余（含多轮）不出便签：TTFT 已挂在「模型调用」输出行（2026-09-30 挂载后原多轮便签
+        # 与之同值重复），总耗时在折叠头；仅"收尾段有实耗/无首字"这两种有独立信息的情况保留。
+
+    _safe_emit(
+        emit,
+        AgentEvent(
+            type="run_end",
+            run_id=run_id,
+            turn=turn,
+            payload={
+                "reason": reason,
+                "turns": turn,
+                "messages": [agent_message_to_dict(m) for m in messages[start_idx:]],
+                "usage": total_usage,
+                "notes": trace_notes,
+                # 观测标注：最终答案来源终态 + 经历的分支（拒答归因/口径审计用）
+                "final_outcome": machine.final_outcome,
+                "path_trace": list(machine.path_trace),
+                # 判分口径豁免：半拒答剥头前原文（仅 model_answer_stripped 有值）
+                "answer_pre_strip": machine.answer_pre_strip,
+            },
+        ),
+    )
+    return messages[start_idx:]
+
+
+def _final_turn_metrics(
+    added_messages: List[AgentMessage],
+    assistant_turns: List[int],
+    first_delta_at: Dict[int, float],
+    turn_usage: Dict[int, Dict[str, Any]],
+    run_started: float,
+) -> Tuple[Optional[int], Optional[int]]:
+    """TTFT 打点口径：run_start → 最终答案轮的首个 message_delta，外加该轮 prompt_tokens。
+
+    最终答案轮 = 本 run 最后一条无 tool_calls 的 assistant 消息对应的 LLM 轮。
+    拒答兜底（finalize_refusal 直接补写、未经 LLM 流式）无 delta，ttft 返回 None。
+    assistant 消息与 assistant_turns 按下标一一对应；末尾多出的 assistant（拒答补写）
+    没有对应 LLM 轮，下标越界即视为非流式收尾。
+    需求 C 注入的首轮工具调用 assistant 不是 LLM 产物（meta 打 injected_tool_call 标记），
+    必须从对齐序列中剔除，否则注入后下标整体错位、指标被误判为拒答补写（双 '-'）。
+    """
+    assistant_msgs = [
+        m for m in added_messages
+        if m.role == "assistant" and not (m.meta or {}).get("injected_tool_call")
+    ]
+    final_idx = next(
+        (i for i in range(len(assistant_msgs) - 1, -1, -1) if not assistant_msgs[i].tool_calls),
+        None,
+    )
+    if final_idx is None or final_idx >= len(assistant_turns):
+        return None, None
+    final_turn = assistant_turns[final_idx]
+    first_delta = first_delta_at.get(final_turn)
+    ttft_ms = int((first_delta - run_started) * 1000) if first_delta is not None else None
+    prompt_tokens = (turn_usage.get(final_turn) or {}).get("prompt_tokens")
+    return ttft_ms, prompt_tokens
+
+
+def _tool_summary(result: ToolResult) -> Dict[str, Any]:
+    return {
+        "call_id": result.call_id,
+        "name": result.name,
+        "is_error": result.is_error,
+        "terminate": result.terminate,
+    }

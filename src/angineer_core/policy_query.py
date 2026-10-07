@@ -1,0 +1,333 @@
+"""P7 终态查询入口：classifier → agent_policy → run_agent_loop。
+
+供 evals 与内部调用使用，返回与旧 /api/query（旧 Dispatcher.dispatch，已清退）兼容的字段结构；
+不依赖 HTTP / FastAPI / asyncio，可在 daemon 线程中直接调用。
+"""
+import logging
+import time
+import uuid
+from typing import Any, Dict, List, Optional
+
+from angineer_core.agent_loop import AgentLoopConfig, run_agent_loop
+from angineer_core.agent_messages import AgentMessage
+
+logger = logging.getLogger(__name__)
+
+
+def _load_doc_nodes(library_id: str, doc_ids: Optional[List[str]]) -> list:
+    """加载知识库 document 节点；失败时返回空列表（检索工具降级）。
+
+    HTTP 优先（docs-api /internal/doc-nodes）；未配置或失败时回退进程内 docs_service 单例。
+    ANGINEER_DISABLE_LOCAL_FALLBACK=1 时禁止本地回退（消灭跨进程直读 SQLite）。
+    """
+    from angineer_core.docs_retrieval_client import client_from_env, local_fallback_disabled
+
+    def _apply_doc_ids(nodes: list) -> list:
+        if doc_ids:
+            ids = set(str(doc_id) for doc_id in doc_ids if str(doc_id).strip())
+            nodes = [n for n in nodes if getattr(n, "id", "") in ids]
+        return nodes
+
+    client = client_from_env()
+    if client is not None:
+        try:
+            return _apply_doc_ids(client.list_doc_nodes(library_id))
+        except Exception as exc:  # noqa: BLE001
+            if local_fallback_disabled():
+                logger.warning("docs-api doc-nodes 失败且本地回退已禁用: %s", exc)
+                return []
+            logger.warning("docs-api doc-nodes 失败，回退本地: %s", exc)
+    elif local_fallback_disabled():
+        logger.warning("未配置 ANGINEER_DOCS_API_URL 且本地回退已禁用，节点清单为空")
+        return []
+    try:
+        from angineer_core import ports
+
+        loader = ports.get_local_nodes_loader()
+        if loader is None:
+            # 引擎不再 import 检索实现包；组装层未注册时按「加载失败」语义降级
+            # （与 docs_service 异常路径一致：警告 + 空列表 → 检索工具无节点）
+            logger.warning("local_nodes_loader 未注册（组装层应注入 docs-core 适配器），节点清单为空")
+            return []
+        # 必须按端口契约传满 (library_id, doc_ids)：少传一个参数会被下面的 except 吞成
+        # "警告 + 空节点"，而空节点 → 检索恒 0 条 → 全量拒答。2026-09-19 夜间就是这么整晚
+        # 变成 0 检索的（适配器 2 参、调用点只传 1 参，且本地回退路径当时没有测试覆盖）。
+        nodes = loader(library_id, doc_ids)
+        return _apply_doc_ids(nodes)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("加载知识库节点失败，agent 检索工具将无节点: %s", exc)
+        return []
+
+
+_ADMISSION_COUNT_KEYS = ("kept", "dropped", "quarreled", "exempted", "cap_dropped")
+
+
+def _aggregate_admission(blocks: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """聚合各检索工具 `_admission` 私有键块（证据上桌/软帽留痕，plan-evidence-admission §1 决策留痕）。
+
+    计数键求和（fail-open 块该键为 None → 跳过，有数就加）；fallback 取或；
+    judge_config 取首个；judge_ms 求和。无块返回 None（评测侧 all_scores 不带此键）。"""
+    if not blocks:
+        return None
+    merged: Dict[str, Any] = {}
+    for key in _ADMISSION_COUNT_KEYS:
+        values = [block.get(key) for block in blocks if isinstance(block.get(key), (int, float))]
+        merged[key] = int(sum(values)) if values else None
+    merged["fallback"] = any(bool(block.get("fallback")) for block in blocks)
+    judge_configs = [str(block.get("judge_config")) for block in blocks if block.get("judge_config")]
+    merged["judge_config"] = judge_configs[0] if judge_configs else None
+    judge_ms_values = [block.get("judge_ms") for block in blocks if isinstance(block.get("judge_ms"), (int, float))]
+    merged["judge_ms"] = int(sum(judge_ms_values)) if judge_ms_values else None
+    return merged
+
+
+def _default_intent_result():
+    from angineer_core.base_contracts import IntentResult
+
+    return IntentResult(
+        intent_level="L1",
+        primary_level="L1",
+        service_mode="semantic_retrieval",
+        execution_plan=["semantic_retrieval"],
+    )
+
+
+def _intent_to_dict(intent_result: Any) -> Dict[str, Any]:
+    if hasattr(intent_result, "model_dump"):
+        try:
+            return intent_result.model_dump(mode="json")
+        except Exception:  # noqa: BLE001
+            pass
+    data = dict(getattr(intent_result, "__dict__", {}) or {})
+    return {k: v for k, v in data.items() if not k.startswith("_")}
+
+
+def run_policy_query(
+    query: str,
+    library_id: str = "default",
+    doc_ids: Optional[List[str]] = None,
+    config_name: Optional[str] = None,
+    mode: str = "instruct",
+    sop_loader: Any = None,
+    inline_citations: Optional[List[Dict[str, Any]]] = None,
+    stage_callback=None,
+    step_callback=None,  # noqa: ARG001  # SOP 步骤回调由 agent 工具内部处理，这里保持签名兼容
+    answer_format: Optional[str] = None,
+) -> Dict[str, Any]:
+    """策略化查询：返回与旧 /api/query 相同结构的字典。
+
+    answer_format=评测侧注入的「答案收尾形态」要求（OfficeQA 注入实验
+    docs/plan-officeqa-arms.md §7.7）：仅 QA 档与 L3 复杂档系统提示词追加，
+    None＝现行为逐字节不变；随返回 dict 同名字段上浮供 prediction 留痕。
+    """
+    started_at = time.time()
+    query_id = f"q-{uuid.uuid4().hex[:12]}"
+    doc_ids = list(doc_ids or [])
+    inline_citations = list(inline_citations or [])
+
+    # 哨兵 b：全链路"吞掉但继续降级"的 LLM 失败统一落点（评测据此区分
+    # 校准拒答与故障吞错式拒答；2026-09-06 53 题全灭事故驱动）
+    llm_errors: List[str] = []
+
+    try:
+        from angineer_core.agent_policy import build_attempts, format_route_note
+        from angineer_core.agent_tools import MarkerAllocator
+        from angineer_core.classifier import IntentClassifier
+        from ai_inference.llm_client import get_llm_client
+
+        # 1. 意图判断
+        t0 = time.time()
+        intent_result = _default_intent_result()
+        try:
+            sops = list(sop_loader.load_all() or []) if sop_loader is not None else []
+            intent_result = IntentClassifier(sops).classify_intent(
+                query, config_name=config_name, mode=mode, error_sink=llm_errors
+            )
+        except Exception as exc:  # noqa: BLE001
+            if getattr(exc, "fatal", False):
+                raise
+            logger.warning("意图分级失败，默认 L1: %s", exc)
+            llm_errors.append(f"意图分级异常: {str(exc)[:300]}")
+        intent_seconds = round(time.time() - t0, 3)
+
+        # 2. 策略展开 + 执行
+        t1 = time.time()
+        allocator = MarkerAllocator()
+        attempts = build_attempts(
+            intent_result=intent_result,
+            scene="docs",
+            library_id=library_id,
+            doc_ids=doc_ids,
+            load_nodes=lambda: _load_doc_nodes(library_id, doc_ids),
+            llm_factory=get_llm_client,
+            config_name=config_name,
+            mode=mode,
+            sop_loader=sop_loader,
+            marker_allocator=allocator,
+            answer_format=answer_format,
+        )
+        config = AgentLoopConfig(
+            llm=get_llm_client(),
+            tools=[],
+            system_prompt="",
+            max_turns=1,
+            attempts=attempts,
+            route_note=format_route_note(intent_result),
+            error_sink=llm_errors,
+        )
+        from angineer_core.trace_collector import TraceCollector
+
+        collector = TraceCollector()
+        messages: List[AgentMessage] = [AgentMessage(role="user", content=query)]
+        added = run_agent_loop(messages, config, emit=collector.emit)
+        loop_seconds = round(time.time() - t1, 3)
+
+        run_payload = collector.run_end_payload()
+        reason = str(run_payload.get("reason") or "completed")
+        turns = int(run_payload.get("turns") or 0)
+        notes = [str(n.get("detail") or "") for n in run_payload.get("notes") or []]
+        # 观测标注（agent_loop 产生）：终态 + 经历的分支，随返回 dict 透传给评测侧
+        final_outcome = run_payload.get("final_outcome")
+        path_trace = list(run_payload.get("path_trace") or [])
+        # 判分口径豁免：半拒答剥头前原文（answer 可能被 guard 改写过，评测按原文判拒答）
+        answer_pre_strip = run_payload.get("answer_pre_strip")
+
+        # 3. 抽取答案 / 证据 / 引用 / SOP trace
+        final_assistant = next(
+            (m for m in reversed(added) if m.role == "assistant" and not m.tool_calls),
+            None,
+        )
+        answer = final_assistant.content if final_assistant else ""
+
+        tool_messages = [m for m in added if m.role == "tool"]
+        retrieved_items: List[Dict[str, Any]] = []
+        seen_ids = set()
+        evidences: List[Dict[str, Any]] = []
+        seen_evidence_ids = set()
+        citations: List[Dict[str, Any]] = []
+        seen_cites = set()
+        sop_trace: List[Dict[str, Any]] = []
+        admission_blocks: List[Dict[str, Any]] = []
+        for message in tool_messages:
+            raw = message.meta or {}
+            block = raw.get("_admission")
+            if isinstance(block, dict):
+                admission_blocks.append(block)
+            for item in raw.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                item_id = str(item.get("item_id") or "")
+                if item_id and item_id in seen_ids:
+                    continue
+                if item_id:
+                    seen_ids.add(item_id)
+                retrieved_items.append(item)
+            for evidence in raw.get("evidences") or []:
+                if not isinstance(evidence, dict):
+                    continue
+                evidence_id = str(evidence.get("evidence_id") or "")
+                if evidence_id and evidence_id in seen_evidence_ids:
+                    continue
+                if evidence_id:
+                    seen_evidence_ids.add(evidence_id)
+                evidences.append(evidence)
+            for citation in raw.get("citations") or []:
+                if not isinstance(citation, dict):
+                    continue
+                cite_key = str(citation.get("target_id") or "") + str(citation.get("marker") or "")
+                if cite_key and cite_key in seen_cites:
+                    continue
+                if cite_key:
+                    seen_cites.add(cite_key)
+                citations.append(citation)
+            if message.name == "sop_execute" and isinstance(raw.get("sop_trace"), list):
+                sop_trace.extend(raw["sop_trace"])
+
+        strategy = f"policy_{intent_result.intent_level}_{intent_result.service_mode} (turns={turns}, reason={reason})"
+        fallback_used = any("回退" in n or "进入下一段" in n for n in notes)
+        stage_timings = {"intent": intent_seconds, "agent_loop": loop_seconds}
+        retrieval_debug = {
+            "agent": {
+                "turns": turns,
+                "tool_calls": len(tool_messages),
+                "reason": reason,
+                "strategy": "policy_agent",
+            },
+            "agent_events": collector.agent_events_dump(),
+        }
+        route_debug = {
+            "route_kind": "policy",
+            "primary_level": intent_result.primary_level or intent_result.intent_level,
+            "execution_plan": list(intent_result.execution_plan or [intent_result.service_mode]),
+            "reason": intent_result.reason or "",
+            "attempted_paths": path_trace,  # 观测：实际经历的分支序列（retry/注入/回退…）
+            "final_path": final_outcome,  # 观测：最终答案来源终态
+            "fallback_reason": next((n for n in notes if "进入下一段" in n or "回退" in n), None),
+        }
+        flow_debug = {
+            "flow_type": "policy_agent",
+            "summary": f"策略化路径完成（{reason}）",
+        }
+
+        if stage_callback is not None:
+            try:
+                stage_callback({
+                    "stage": "intent",
+                    "stage_timings": stage_timings,
+                    "intent": _intent_to_dict(intent_result),
+                    "answer": answer,
+                    "citations": citations,
+                    "retrieved_items": retrieved_items,
+                    "evidences": evidences,
+                })
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("stage_callback 异常（已忽略）: %s", exc)
+
+        from angineer_core.prompts import versions as _prompt_versions
+
+        pv = dict(_prompt_versions())
+        try:
+            from angineer_core.agent_configs import effective_qa_prompt_version
+
+            pv["agent_configs.qa_system_prompt"] = effective_qa_prompt_version()
+        except Exception:  # noqa: BLE001 版本标注失败不阻断主流程
+            pass
+
+        return {
+            "query_id": query_id,
+            "session_key": "",
+            "intent": _intent_to_dict(intent_result),
+            "answer": answer or "",
+            "citations": citations,
+            "retrieved_items": retrieved_items,
+            "evidences": evidences,
+            "sql": None,
+            "fallback_used": fallback_used,
+            "latency_ms": int((time.time() - started_at) * 1000),
+            "strategy": strategy,
+            "system_prompt": "",
+            "retrieval_debug": retrieval_debug,
+            # 证据上桌/软帽留痕聚合（evals 经 prediction 写入 all_scores.retrieval.admission）
+            "admission": _aggregate_admission(admission_blocks),
+            "llm_errors": llm_errors,
+            "runtime_flags": (["llm_error_degraded"] if llm_errors else []),
+            "route_debug": route_debug,
+            "flow_debug": flow_debug,
+            # 观测标注：拒答归因/口径审计用（评测侧写入 prediction 持久化）
+            "final_outcome": final_outcome,
+            "path_trace": path_trace,
+            "answer_pre_strip": answer_pre_strip,
+            # 注入实验逐题留痕（§7.7）：随 prediction 持久化，判读时可按题核对注入态
+            "answer_format": answer_format,
+            "trace_notes": notes,
+            "stage_timings": stage_timings,
+            "prompt_versions": pv,
+            "inline_citation_count": len(inline_citations),
+            "sop_trace": sop_trace,
+            "gap_analysis": None,
+            "confidence_breakdown": None,
+            "scope": {"library_id": library_id, "doc_ids": list(doc_ids)},
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.error("策略化查询失败: %s", exc, exc_info=True)
+        return {"error": f"评测查询失败: {exc}"}
