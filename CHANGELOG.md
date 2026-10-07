@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1
+
+- fix: **观测打点不再写进宿主工作目录**。`ops_metrics` 的落盘目录探测此前在找不到主仓库标记（同时含 `services/` 与 `apps/`）时回落到 `Path.cwd()`——于是 pip 装到 site-packages 的环境里，TTFT / 工具耗时 / 检索分段等 jsonl（内容含用户提问片段，如 `inspect_evidence` 记 `query[:120]`）会被写进宿主进程的工作目录。现在改为：找不到标记即 `ops_dir()` 返回空串、`record_event` 静默跳过；要落盘必须显式给 `ANGINEER_OPS_DIR`。**主仓库树内行为一字不变**（本机 repo 与生产镜像都是 `pip install -e`，`__file__` 在主仓库树内 → 默认仍是 `<仓库根>/data/ops`）
+- chore: 新增 `tests/test_ops_metrics.py` 锁边界——树外默认不落盘且不碰 cwd / 显式给目录照常落盘 / 树内默认目录不变 / `ANGINEER_OPS_DISABLE` 优先级最高 / 上下文 `run_id` 随打点落库；另有一条「主仓库树内能命中标记」的用例（独立仓 / site-packages 环境自动跳过）
+- docs: README 补两处口径——环境变量表增加 `ANGINEER_OPS_DIR` / `ANGINEER_OPS_DISABLE` 的默认值与优先级；并写明本库与其依赖 `angineer-ai-inference` 在 **import 时**各按 python-dotenv 规则加载一次 `.env`（`override=False`，已存在的环境变量不被覆盖），宿主据此可自控环境
+
 ## 0.1.0（对外发布基线）
 
 首个对外发布版本：AnGIneer 的问答编排内核（Agent Harness 引擎）从主仓库独立成包。
