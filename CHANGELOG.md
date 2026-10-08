@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.2
+
+- fix: 出处守卫书名号闸「标题核不到」降级为软信号——答案引用的论文/真题名在证据面（`doc_title`=文件名）核不到时，若「第X章/节/条」引号章节名或裸数字条款号在证据中可核（归一化命中／数字链 `X.Y+`）则放行、落入原有编号核对；标题与章节号双双核不到仍判编造。修 v0.2.92 书名号闸两晚把 30+ 题好答案整答换拒答（OpenRAG −2.6pp、24 题误杀）
+- fix: 外部文献名引用降为剥标记（方案 A）——`find_unsupported_reference` 三态化：编造规范编号仍 hard 整答替换；「标题全核不到 + 章节不可信」降为 strip（`_strip_absent_citations` 摘句首《X》状语、悬空章节号补「⚠️出处待核」、正文事实保留，不再换成拒答）；`has_unsupported_reference` 语义收口为 hard-only，兼容旧调用点；新增结果码 `external_citation_stripped`（`final_outcome=model_answer_stripped`，`path_trace` 记痕）
+
 ## 0.1.1
 
 - fix: **观测打点不再写进宿主工作目录**。`ops_metrics` 的落盘目录探测此前在找不到主仓库标记（同时含 `services/` 与 `apps/`）时回落到 `Path.cwd()`——于是 pip 装到 site-packages 的环境里，TTFT / 工具耗时 / 检索分段等 jsonl（内容含用户提问片段，如 `inspect_evidence` 记 `query[:120]`）会被写进宿主进程的工作目录。现在改为：找不到标记即 `ops_dir()` 返回空串、`record_event` 静默跳过；要落盘必须显式给 `ANGINEER_OPS_DIR`。**主仓库树内行为一字不变**（本机 repo 与生产镜像都是 `pip install -e`，`__file__` 在主仓库树内 → 默认仍是 `<仓库根>/data/ops`）
