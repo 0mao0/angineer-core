@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.4
+
+- feat: **独立宿主壳 `[server]` extra（chat-api）**——`angineer_core.server:app` 把 agent 编排以 SSE 服务形态直接暴露：`POST /api/chat/agent`（AgentEvent 帧、`frame_version: 1`、首帧 `route_debug`、流末 `[DONE]`）、`GET /health`；可选 `ANGINEER_API_TOKEN` 门（`X-API-Key` / `Bearer`）。SOP 发布面 / chat-history / admin 鉴权均不依赖，缺之照常启动；fastapi / uvicorn 只进 extra，纯库消费者不变重（与 AnGIneer 内部服务同源同行为）
+- feat: `route_pre` 自内部服务迁入本包（`angineer_core.route_pre`）单点维护——`route_request` 派工单 / 赌博式预检 `fire_speculative_first_search` / `route_debug` 首帧；对 docs-core 的表题判别依赖转为可选降级（未装 docs-core 照常预检）；`base_contracts` 增 `normalize_library_ids` 引擎侧镜像（独立壳不依赖 docs-core 的等价实现）
+- feat: **查表错配双闸 + 矩阵表读表判读通道 `table_read`**——表号形态（表5.4.8 / 表A.0.1）编号显式匹配全 miss 时显式报错（附候选 context 诊断），禁止拆词兜底把「找不到表」伪装成「行不匹配」（LNG 实踩）；`table_read` 对矩阵 / 双层表头表交单次 LLM 抽取并回填单元格引用（可审计），sop_runner / agent_tools 工具白名单同步
+- feat: SOP 引导与证据三件——**L3 点名引导**（TF-IDF 粗筛 top-1≥0.10 时向复杂档提示词注入「疑似适用 SOP」，`ANGINEER_SOP_L3_HINT` 默认开）；**证据闸纳入 SOP 成功步骤产出**（修「仅调 SOP 未调检索」被 no_evidence 整答误杀；步骤全失败仍拒答）；**复杂档提示词版本机制** `ANGINEER_COMPLEX_PROMPT_VERSION`（预留回退位，当前仅注册 v5）
+- feat: classifier 参数派生补「设计高 / 低水位」（SOP 受力控制路径 `${设计高水位}` 直接引用）
+
 ## 0.1.3
 
 - feat: **SOP 领域知识外置为领域知识包（domain pack）**——`classifier.PARAM_DESCRIPTIONS` 不再硬编码疏浚/海港参数词典（默认空 dict，引擎零领域内容）；新增 `sop_domain.load_domain_pack_from_env()`，宿主经 `ANGINEER_SOP_DOMAIN_PACK`（内置包名如 `harbor`，或任意 JSON 文件路径）显式启用，调用期惰性加载、加载失败按空包降级告警；内置包 `domain_packs/harbor.json` 随 wheel 打包（setuptools `package-data`）。`IntentClassifier` 新增 `param_descriptions` 构造参数、`SopRunner` 新增 `domain_hints`（参数释义 / 工具输出别名 `output_aliases` / calculator 领域提示三字段独立注入），`SopRunnerAdapter` 自动接线；**不启用领域包时行为逐字不变**
