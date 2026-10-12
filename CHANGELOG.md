@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.5
+
+- fix: **独立壳补六端口 HTTP 适配器**（`angineer_core.server.http_ports`）——HTTP 检索模式下工具结果曾缺 `citations`（前端引用为空）、phrase rerank 与条款号归一化被跳过、canonical 查表找不到册、calculator 一调用即报错（根因：壳无组装层、进程内端口全为 None；外部消费方同题对照实测）。壳启动时自动注册六端口 HTTP 等价物（normalize_query / relevant_citations / local_rerank / local_nodes_loader / table_blocks / engtool_registry → 检索服务 `/internal/normalize-query`·`/rerank`·`/relevant-citations`·`/doc-nodes`·`/table-blocks`·`/engtool-run`；配 `ANGINEER_DOCS_API_URL` 生效，`ANGINEER_HTTP_PORTS=0` 关闭）；网络失败一律降级为原行为、绝不发工具级异常（`table_blocks` 例外按显式失败上浮）。行为与进程内装配对齐（同一份 docs-core 实现）
+- fix: 壳启动即配 `logging.basicConfig`——此前日志落 lastResort（stderr 裸格式），排障时误判「警告没落日志」
+- feat: 领域包扩「参数规则」段 + classifier 注入式重构（随本批直通）——`domain_packs/harbor.json` 增 arg_rules 30 条 / arg_computes 7 算子 / 船型 6 表 / 停用词 21 / 清洗规则；新 `domain_arg_rules` 应用器（不做泛化 DSL）；classifier 改 `domain_args` 注入（**不启用领域包时默认零领域规则，行为逐字不变**）；Hnav 取值链（显式值＞乘潮 90~95% 档＞设计低水位，JTS 165 §4.5.2.4 口径）与桥区通航净空尺度输出映射修复；对拍 23/23 旧键全等
+- chore: `angineer_core.server` 惰性导出（导入 `server.http_ports` 不再构造壳应用）；`DocsRetrievalClient` 增 normalize_query / rerank / relevant_citations / table_blocks / run_engtool 五方法
+- 已知限制：`/internal/engtool-run` 的执行体 `angineer-engtools` 未随壳发布——需 calculator / conditional 的独立部署请从主仓库源码安装该包；未安装时调用按显式 503 降级（不再静默）
+
 ## 0.1.4
 
 - feat: **独立宿主壳 `[server]` extra（chat-api）**——`angineer_core.server:app` 把 agent 编排以 SSE 服务形态直接暴露：`POST /api/chat/agent`（AgentEvent 帧、`frame_version: 1`、首帧 `route_debug`、流末 `[DONE]`）、`GET /health`；可选 `ANGINEER_API_TOKEN` 门（`X-API-Key` / `Bearer`）。SOP 发布面 / chat-history / admin 鉴权均不依赖，缺之照常启动；fastapi / uvicorn 只进 extra，纯库消费者不变重（与 AnGIneer 内部服务同源同行为）
