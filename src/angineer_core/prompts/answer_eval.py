@@ -36,5 +36,58 @@ SEMANTIC_EVAL_PROMPT = """\
 SEMANTIC_EVAL_SYSTEM_PROMPT = "你是一个严格的评测助手，只返回 JSON 格式的评分结果。"
 
 
+# 该拒题未拒时的二段判定（2026-10-09，report-refusal-3sets-audit-20261009 §4.4）：
+# 区分「有据未拒」（证据里确实有答案，拒答前提不成立）与「编造」（真幻觉）。
+EVIDENCE_SUPPORT_PROMPT = """\
+你是评测助手。判断"系统答案"的核心事实性主张是否被"检索证据"支持。
+
+检索证据：
+{evidence}
+
+系统答案：{system_answer}
+
+判定规则：
+- 系统答案的核心结论能在检索证据中找到明确依据（同义改写、跨语言、繁简差异均算），
+  判 supported=true。
+- 核心结论在证据中无依据、与证据矛盾、或答案超出证据覆盖的部分含关键事实性主张，
+  判 supported=false。
+- 不得因证据与答案详略/措辞不同而判 false；也不得因答案"听起来合理"而判 true。
+
+返回 JSON：{{"supported": true/false, "reason": "简短说明"}}"""
+
+
+EVIDENCE_SUPPORT_SYSTEM_PROMPT = "你是一个严格的评测助手，只返回 JSON 格式的判定结果。"
+
+
 register("answer_eval.semantic_eval_prompt", "v4", SEMANTIC_EVAL_PROMPT)
 register("answer_eval.semantic_eval_system_prompt", "v1", SEMANTIC_EVAL_SYSTEM_PROMPT)
+register("answer_eval.evidence_support_prompt", "v1", EVIDENCE_SUPPORT_PROMPT)
+register("answer_eval.evidence_support_system_prompt", "v1", EVIDENCE_SUPPORT_SYSTEM_PROMPT)
+
+
+# 该拒题未拒时的内容判分（2026-10-10，report-refusal-underrefusal-content-judge-20261010 常设化）：
+# 未拒答案 vs 公开 gold 三档——把「严格出处口径」的欠拒拆成 内容正确 / 内容错 / 边界。
+REFUSAL_CONTENT_PROMPT = """\
+你是严格的事实一致性判官。输入：一个问题、该问题的标准答案（gold）、一个待判答案。只判「待判答案的内容与结论是否与 gold 一致」，不考虑出处、引用格式、语言或篇幅。
+
+问题：{question}
+
+标准答案（gold）：{gold_answer}
+
+待判答案：{answer}
+
+只输出一个 JSON 对象，不要其他文字：
+{{"verdict": "correct|wrong|uncertain", "reason": "不超过 60 字"}}
+
+判定规则：
+- correct：待判答案的结论与 gold 实质一致；表述、符号、语序不同但事实相同算 correct；gold 为 Yes/No 型时判决词一致且理由不与 gold 冲突算 correct。
+- wrong：核心结论与 gold 相反，或关键事实/数值与 gold 冲突。
+- uncertain：只覆盖部分要点、答非所问、或 gold 信息不足以判断待判答案的主要结论是否成立。
+拿不准时不许给 correct。"""
+
+
+REFUSAL_CONTENT_SYSTEM_PROMPT = "你是一个严格的事实一致性判官，只返回 JSON 格式的判定结果。"
+
+
+register("answer_eval.refusal_content_prompt", "v1", REFUSAL_CONTENT_PROMPT)
+register("answer_eval.refusal_content_system_prompt", "v1", REFUSAL_CONTENT_SYSTEM_PROMPT)
