@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.3
+
+- feat: **SOP 领域知识外置为领域知识包（domain pack）**——`classifier.PARAM_DESCRIPTIONS` 不再硬编码疏浚/海港参数词典（默认空 dict，引擎零领域内容）；新增 `sop_domain.load_domain_pack_from_env()`，宿主经 `ANGINEER_SOP_DOMAIN_PACK`（内置包名如 `harbor`，或任意 JSON 文件路径）显式启用，调用期惰性加载、加载失败按空包降级告警；内置包 `domain_packs/harbor.json` 随 wheel 打包（setuptools `package-data`）。`IntentClassifier` 新增 `param_descriptions` 构造参数、`SopRunner` 新增 `domain_hints`（参数释义 / 工具输出别名 `output_aliases` / calculator 领域提示三字段独立注入），`SopRunnerAdapter` 自动接线；**不启用领域包时行为逐字不变**
+- feat: `SopRunner.run` 真按步骤图遍历执行——步骤失败且 `on_failure` 指向未执行步骤时跳转（被跳过的中间步骤记 `skipped`），无可用跳转时回退原线性序；`next_step_id`/`on_failure` 自 P4 起是 SOP 契约字段，本版起被执行面真正消费
+- feat: prompts——QA 系统提示词 v18（规则 2「写明出处」加适用前提：仅对象核对通过后适用，对象核不上禁止用《X》包装相邻片段，按规则 3 走「未覆盖 + 供参考」第三档）；`answer_eval` 新增 `evidence_support_prompt` v1（该拒未拒二段判定：区分有据未拒与真幻觉）与 `refusal_content_prompt` v1（未拒答案 vs gold 三档 correct/wrong/uncertain）；SOP 执行 calculator hint 升 v2（领域取值规则 K1/折减系数迁往领域包，提示词仅留通用推导规则）
+
 ## 0.1.2
 
 - fix: 出处守卫书名号闸「标题核不到」降级为软信号——答案引用的论文/真题名在证据面（`doc_title`=文件名）核不到时，若「第X章/节/条」引号章节名或裸数字条款号在证据中可核（归一化命中／数字链 `X.Y+`）则放行、落入原有编号核对；标题与章节号双双核不到仍判编造。修 v0.2.92 书名号闸两晚把 30+ 题好答案整答换拒答（OpenRAG −2.6pp、24 题误杀）
