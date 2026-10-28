@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.6
+
+- fix: agent 循环幻觉工具名熔断——模型连续 `ANGINEER_TOOL_HALLUCINATION_TURNS`（默认 2，0=关）轮调用的工具全部未注册时，直接转无工具直答收尾（reason=tool_hallucination_breaker），不再烧光轮次预算一题未答；轮内混入真实工具即清零计数、换段复位，不误伤正常重试
+- feat: QA prompt v20 规则 18 图表化交付——数据题表格后附 angineer-chart/angineer-map 块，数值必须来自证据；title/categories/series.name 写纯文本、禁 LaTeX 与 $ 记号（echarts 不走公式引擎）
+- fix(citations): Kxx 引用标记容忍括号内空格（渲染、过滤、守卫三层同修）；引用解析表默认覆盖全部 cite 标记——修答案引用第 6 条以后前端解析不到、回退显示 doc_id
+- feat(retrieval): 新增文档级检索工具 doc_search/doc_read（枚举题车道）；doc_search 增时间维度（sort_by/date_after/date_before）、entity_contains 实体范围与唯一命中 authoritative 卡片；doc_read 增 section 按章节读、match 模式 AND→OR 回退；检索分组抽象（group_id/group_kind、目录谓词、matter 清单）
+- fix(table): 表格 query 首次无行数值允许按指标名/报表名改写一次再查；doc 范围明确且候选无完整表时按该文档 canonical 表格块兜底（全量 token 去重打分）；表查询引擎修三缺陷族（LaTeX 目标列失配回落成对列、区间列错配、右半区只扫首列选错行）与 '<=' 含等号误判方程
+- feat(sop): SOP 领域知识外置 domain pack（`ANGINEER_SOP_DOMAIN_PACK` 按名/按 JSON 路径启用，内置 harbor 随 wheel 打包）；精排 LLM 加内层超时闸（`ANGINEER_SOP_ROUTE_LLM_TIMEOUT` 默认 30s）；L3 点名引导与证据闸纳入成功步骤产出；run 按真值步骤图遍历执行（next_step_id/on_failure 跳转生效，被跳过步骤记 skipped）
+- fix(classifier): 公式/指标定义问句不再判 L3（须有具体数值参数）；L3 无匹配 SOP 回退语义检索；L0 闲聊词表补「笑话」
+- feat(agent): 实验臂（默认关）——枚举闭集守卫与结构化整答（P4/P4b/P5）、枚举预取目录模式（P0.5）；删除失败的 P2.1/P2.2 证据绑定实验（默认从未启用）；graph 抽取并发闸门与问答轮数/预算闸放开（Harvey LAB 实踩）；budget stopper docstring 纠偏（显式 threshold＝真实 token 线，仅 usage 路径）
+
+
 ## 0.1.5
 
 - fix: **独立壳补六端口 HTTP 适配器**（`angineer_core.server.http_ports`）——HTTP 检索模式下工具结果曾缺 `citations`（前端引用为空）、phrase rerank 与条款号归一化被跳过、canonical 查表找不到册、calculator 一调用即报错（根因：壳无组装层、进程内端口全为 None；外部消费方同题对照实测）。壳启动时自动注册六端口 HTTP 等价物（normalize_query / relevant_citations / local_rerank / local_nodes_loader / table_blocks / engtool_registry → 检索服务 `/internal/normalize-query`·`/rerank`·`/relevant-citations`·`/doc-nodes`·`/table-blocks`·`/engtool-run`；配 `ANGINEER_DOCS_API_URL` 生效，`ANGINEER_HTTP_PORTS=0` 关闭）；网络失败一律降级为原行为、绝不发工具级异常（`table_blocks` 例外按显式失败上浮）。行为与进程内装配对齐（同一份 docs-core 实现）
