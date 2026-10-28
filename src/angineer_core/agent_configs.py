@@ -1,9 +1,10 @@
 """P3.1 知识问答 + P4.1 大题型 agent 循环配置装配。"""
 import json
+import logging
 import os
 import re
 from dataclasses import replace
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from angineer_core.agent_loop import _INJECTED_USER_PROMPTS, AgentLoopConfig, TurnContext
 from angineer_core.agent_messages import AgentMessage, is_refusal_text, strip_half_refusal_lead
@@ -13,16 +14,21 @@ from angineer_core.agent_tools import (
     RetrieverAdapter,
     SopRunnerAdapter,
     StatsAdapter,
+    ToolSchemaAdapter,
 )
 from angineer_core.prompts.agent_configs import (  # noqa: F401  # P5 资产化后 re-export，保持旧导入兼容
     COMPLEX_AGENT_SYSTEM_PROMPT,
     FOLLOWUP_QUESTION_RULE,
-    QA_AGENT_SYSTEM_PROMPT,
+    NO_FOLLOWUP_QUESTION_RULE,
 )
+# 裸别名 QA_AGENT_SYSTEM_PROMPT（原 re-export，钉死 V11 已与 latest 漂移）已清退，勿复引入。
 from angineer_core.tool_codec import TextToolCallCodec
 
 
 _MARKER_RE = re.compile(r"\[([KTE]\d+)\]")
+# 括号内空格形态（`[ K32]`、`[K 32 ]`）：不先归一，_MARKER_RE 漏匹配，
+# 伪造标记清理、前端标记→tag、引用过滤会一起漏（2026-10-26 Kxx 纯文本回归）
+_MARKER_SPACED_RE = re.compile(r"\[\s*([KTE])\s*(\d+)\s*\]")
 
 
 def effective_qa_prompt_version() -> str:
@@ -35,7 +41,7 @@ def effective_qa_prompt_version() -> str:
 
 
 def effective_complex_prompt_version() -> str:
-    """复杂档 prompt 生效版本（env 指定或 latest）；当前注册仅 v5，机制预留供后续版本回退。"""
+    """复杂档 prompt 生效版本（env 指定或 latest）；当前注册 v5/v6，机制预留供后续版本回退。"""
     return os.getenv("ANGINEER_COMPLEX_PROMPT_VERSION", "latest").strip() or "latest"
 
 
@@ -52,6 +58,20 @@ def _load_qa_system_prompt() -> str:
     return load("agent_configs.qa_system_prompt", effective_qa_prompt_version())
 
 
+def _item_cite(item: Any) -> str:
+    """条目引用号：兼容投影前后两种存放位置。
+
+    LLM 投影（agent_loop._project_items）把 metadata.cite 提升到条目顶层；
+    只读 metadata 的写法在生产实为恒空——守卫据此把真标记全判成编造并剥除，
+    问答正文的引用标记（内联圆圈）自 2026-10-06 起全部消失（2026-10-16 定位）。
+    顶层与 metadata 两处都读，缺一即复发。
+    """
+    if not isinstance(item, dict):
+        return ""
+    cite = item.get("cite") or (item.get("metadata") or {}).get("cite")
+    return str(cite or "")
+
+
 def _valid_markers(added_messages: List[AgentMessage]) -> set:
     valid = set()
     for message in added_messages:
@@ -62,10 +82,9 @@ def _valid_markers(added_messages: List[AgentMessage]) -> set:
         except Exception:  # noqa: BLE001
             continue
         for item in (raw.get("items") or []) if isinstance(raw, dict) else []:
-            if isinstance(item, dict):
-                cite = (item.get("metadata") or {}).get("cite")
-                if cite:
-                    valid.add(str(cite))
+            cite = _item_cite(item)
+            if cite:
+                valid.add(cite)
     return valid
 
 
@@ -207,6 +226,13 @@ def make_final_answer_guard(enforce_evidence: bool = True, followup_question: bo
         envelope_unwrapped = unwrapped is not None
         if envelope_unwrapped:
             answer = unwrapped or ""
+        # 括号内空格形态归一为紧形式（`[ K32]` → `[K32]`）：后续无效标记清理、
+        # 前端标记→tag 映射、引用过滤都只认紧形式，不归一则三处同漏
+        normalized_answer = _MARKER_SPACED_RE.sub(
+            lambda m: f"[{m.group(1)}{m.group(2)}]", answer
+        )
+        marker_whitespace_normalized = normalized_answer != answer
+        answer = normalized_answer
         # 守卫内共用：证据内生效的标记集合（无工具消息时为空集，所有标记视为编造）。
         # 所有保留正文的分支（half_refusal_stripped / refusal_kept / markers_cleaned）
         # 都必须过无效标记清理——refusal_kept 此前早退跳过清理，L2→L1 回退段
@@ -247,8 +273,10 @@ def make_final_answer_guard(enforce_evidence: bool = True, followup_question: bo
                         if not isinstance(_step, dict) or _step.get("status") != "success":
                             continue
                         _out = _step.get("outputs")
-                        if isinstance(_out, dict):
-                            _txt = str(_out.get("result") or "").strip()
+                        if isinstance(_out, dict) and _out.get("result") is not None:
+                            # result=0/False 是合法成功产出（原 `or ""` 将其当空串丢失，
+                            # 只有此类成功步时证据面为空 → 误杀；2026-10-13 Q1 实踩）
+                            _txt = str(_out.get("result")).strip()
                             if _txt:
                                 sop_parts.append(_txt[:2000])
                     if sop_parts:
@@ -339,6 +367,12 @@ def make_final_answer_guard(enforce_evidence: bool = True, followup_question: bo
                 "边界规则：最终回答为单键 {\"answer\"} 信封，已拆封取内文",
                 "answer_envelope_unwrapped",
             )
+        if marker_whitespace_normalized:
+            return (
+                answer,
+                "边界规则：引用标记括号内空格已归一（如 `[ K3]` → `[K3]`）",
+                "marker_whitespace_normalized",
+            )
         return None
 
     return guard
@@ -380,6 +414,15 @@ def build_chat_config(
 def _followup_question_enabled() -> bool:
     """ANGINEER_FOLLOWUP_QUESTION 开关解析：true/1/yes/on 视为开，其余视为关（默认开）。"""
     return os.getenv("ANGINEER_FOLLOWUP_QUESTION", "true").strip().lower() in ("true", "1", "yes", "on")
+
+
+def _complex_followup_question_enabled() -> bool:
+    """L3/L4（复杂档）末尾追问开关：ANGINEER_COMPLEX_FOLLOWUP_QUESTION，默认关。
+
+    2026-10-13 业主定：L3/L4 答案不要「您是否想了解…」类邀请式问句（观感像客服话术）；
+    缺参场景保留陈述句引导（由结尾规则承载）。全局 ANGINEER_FOLLOWUP_QUESTION=false 仍可整体关。
+    """
+    return os.getenv("ANGINEER_COMPLEX_FOLLOWUP_QUESTION", "false").strip().lower() in ("true", "1", "yes", "on")
 
 
 def _eager_compress_enabled() -> bool:
@@ -450,14 +493,20 @@ def build_qa_config(
     followup_question: Optional[bool] = None,
     max_tokens_est: Optional[int] = None,
     answer_format: Optional[str] = None,
+    enum_context: Optional[str] = None,
+    audit_query: Optional[str] = None,
 ) -> AgentLoopConfig:
-    """装配 QA 档 agent 循环：四个只读工具（三检索 + 知识库统计）+ 内联 QA prompt（P5 前）。
+    """装配 QA 档 agent 循环：L1 工具箱（7 类工具 + tool_schema 懒加载元工具）。
 
     answer_format=评测侧注入的「答案收尾形态」要求（OfficeQA 注入实验，
     docs/plan-officeqa-arms.md §7.7）：非空时原样追加到系统提示词末尾；
     None＝现行为逐字节不变，仅评测调用方传参，HTTP chat 不暴露。
+
+    enum_context=枚举题预取候选（enum_prefetch.build_enum_context）：非空时作为
+    「预取证据」段追加到系统提示词（不是规则），None＝逐字节不变。
     """
     effective_tools = tools
+    lazy_schema = tools is None
     if effective_tools is None:
         effective_knowledge_task_type = knowledge_task_type or task_type
         effective_table_task_type = table_task_type or task_type
@@ -492,15 +541,25 @@ def build_qa_config(
             config_name=config_name,
             mode=mode,
         )
+        # 文档级检索 + 批量读页（2026-10-18 枚举型任务改造）：段落 top-20 覆盖不了全库，
+        # 「列出所有/每一个」类问题必须先用 doc_search 拿候选全集，再 doc_read 逐篇确认。
+        doc_search_tool = RetrieverAdapter.doc_search(
+            library_id=library_id,
+            library_ids=library_ids,
+        )
+        doc_read_tool = RetrieverAdapter.doc_read(
+            library_id=library_id,
+            library_ids=library_ids,
+        )
         # 查表/数值类任务把 table_search 排在首位，引导模型优先用它
         table_first = (
             str(effective_table_task_type).startswith("table_")
             or str(effective_table_task_type) in {"locate_table", "locate_qa"}
         )
         ordered = (
-            [table_tool, knowledge_tool, entity_tool]
+            [table_tool, doc_search_tool, doc_read_tool, knowledge_tool, entity_tool]
             if table_first
-            else [knowledge_tool, table_tool, entity_tool]
+            else [knowledge_tool, doc_search_tool, doc_read_tool, table_tool, entity_tool]
         )
         # knowledge_stats 下沉 L1 统一工具箱（废 meta_query 路由第二步，2026-10-02）：
         # 统计题与正文题同档、模型按工具描述自选；工具描述已把「只在问知识库本身」边界写死（§2.5 暴露面）
@@ -524,12 +583,17 @@ def build_qa_config(
                 read_only=False,
             )
         )
-        effective_tools = ordered
+        effective_tools = list(ordered)
+        # 懒加载：system 只给工具名+用途；schema 由 tool_schema 按需取。
+        schema_tool = ToolSchemaAdapter.tool_schema(effective_tools)
+        effective_tools.insert(0, schema_tool)
 
     system_prompt = _load_qa_system_prompt()
     explicit = _build_inline_citation_context(inline_citations or [])
     if explicit:
         system_prompt += "\n\n显式引用证据（用户已确认，优先级最高）：\n" + explicit
+    if enum_context:
+        system_prompt += "\n\n" + str(enum_context).strip()
 
     followup_enabled = _followup_question_enabled() if followup_question is None else bool(followup_question)
     if followup_enabled:
@@ -545,6 +609,63 @@ def build_qa_config(
             enforce_evidence=enforce_evidence,
             followup_question=followup_enabled,
         )
+    # P3 答案自检：仅枚举题 + 开关 + 库白名单；失败/关闭时 guard 原样不变
+    if audit_query:
+        try:
+            from angineer_core.answer_audit import enabled as _audit_enabled
+            from angineer_core.answer_audit import library_allowed as _audit_library_allowed
+            from angineer_core.answer_audit import make_audit_guard
+            from angineer_core.enum_prefetch import is_enumeration
+
+            if _audit_enabled() and _audit_library_allowed(library_id) and is_enumeration(audit_query):
+                guard = make_audit_guard(
+                    guard,
+                    llm=llm,
+                    question=audit_query,
+                    enabled_for_query=True,
+                    config_name=config_name,
+                    mode=mode,
+                )
+        except Exception as _exc:  # noqa: BLE001 —— 自检装配失败不影响原 guard
+            logging.getLogger(__name__).warning("answer_audit 装配失败: %s", _exc)
+
+    # P4/P5 枚举答案约束：结构化生成优先（整答由渲染器产出），否则退到闭集改写；
+    # 两者开关默认关，失败保持原答案。
+    if enum_context:
+        try:
+            from angineer_core.structured_answer import enabled as _struct_enabled
+            from angineer_core.structured_answer import make_struct_guard
+
+            logging.getLogger(__name__).info(
+                "枚举答案约束装配：enum_context=%d 字 struct=%s",
+                len(str(enum_context)), _struct_enabled(),
+            )
+            if _struct_enabled():
+                guard = make_struct_guard(
+                    guard,
+                    llm=llm,
+                    question=audit_query or "",
+                    enabled_for_query=True,
+                    evidence_context=str(enum_context),
+                    config_name=config_name,
+                    mode=mode,
+                )
+            else:
+                from angineer_core.enum_closed_set import enabled as _closed_set_enabled
+                from angineer_core.enum_closed_set import make_closed_set_guard
+
+                if _closed_set_enabled():
+                    guard = make_closed_set_guard(
+                        guard,
+                        llm=llm,
+                        question=audit_query or "",
+                        enabled_for_query=True,
+                        closed_set_context=str(enum_context),
+                        config_name=config_name,
+                        mode=mode,
+                    )
+        except Exception as _exc:  # noqa: BLE001 —— 约束装配失败不影响原 guard
+            logging.getLogger(__name__).warning("enum answer guard 装配失败: %s", _exc)
 
     budget_est = _qa_budget_tokens_est() if max_tokens_est is None else int(max_tokens_est)
     qa_transformer = (
@@ -564,7 +685,7 @@ def build_qa_config(
         tools=effective_tools,
         system_prompt=system_prompt,
         max_turns=max_turns,
-        codec=TextToolCallCodec(),
+        codec=TextToolCallCodec(include_schemas=not lazy_schema),
         final_answer_guard=guard,
         route_note=route_note,
         followup_question=followup_enabled,
@@ -611,14 +732,16 @@ def _item_pointer_keys(items: List[Any], limit: int = 6) -> str:
     for item in items:
         if not isinstance(item, dict):
             continue
-        doc_id = str(item.get("doc_id") or "")
+        # 投影形态兼容：doc_id 在顶层（投影白名单保留），旧形态在 metadata；
+        # 两处都不读会把整条指针丢掉（doc_id 空即 continue）
+        meta = item.get("metadata") or {}
+        doc_id = str(item.get("doc_id") or meta.get("doc_id") or "")
         if not doc_id or doc_id in seen:
             continue
         seen.add(doc_id)
-        meta = item.get("metadata") or {}
-        title = str(meta.get("doc_title") or item.get("title") or "")
+        title = str(item.get("doc_title") or meta.get("doc_title") or item.get("title") or "")
         title = re.sub(r"\.(pdf|docx?|xlsx?|pptx?|md|txt)$", "", title, flags=re.IGNORECASE)[:24]
-        cite = str(meta.get("cite") or "")
+        cite = _item_cite(item)
         tag = f"{cite}·{title}" if cite and title else (cite or title or doc_id)
         keys.append(f"{tag}[doc_id={doc_id}]")
         if len(keys) >= limit:
@@ -704,14 +827,34 @@ def _budget_stopper_est() -> int:
     return _budget_tokens_est("ANGINEER_BUDGET_STOPPER_EST", 120_000)
 
 
-def make_budget_stopper(threshold: Optional[int] = None):
-    """P4.3 闸门二：turn 结束估算超阈值 → 循环优雅停止（reason=should_stop）。
+def _budget_stopper_tokens() -> int:
+    """真实 prompt token 口径的停止线（ANGINEER_BUDGET_STOPPER_TOKENS，默认 120000）。
 
-    threshold 显式传参优先（测试/特殊档位用）；不传读 ANGINEER_BUDGET_STOPPER_EST。"""
-    resolved = threshold if threshold is not None else _budget_stopper_est()
+    2026-10-18：原实现只看 chars//2 估算，长题干 + 一次 20 块检索就能越线
+    （Harvey LAB 实踩：prompt 40,499 tokens 即被判超 120k est，模型还没作答就被收尾）。
+    真实 token 更准，且能随模型窗口直接设。默认值从 160k 下调到 120k：网关口径
+    qwen3.6-35b 的安全容量只有 138,146 tokens（2026-10-18 实测 155,582 tokens 直接
+    400 context_length_exceeded，整题中断）——停止线必须低于真实窗口，不能按标称 233k 设。
+    估算口径保留为兜底：网关没回 usage 时才用。"""
+    return _budget_tokens_est("ANGINEER_BUDGET_STOPPER_TOKENS", 120_000)
+
+
+def make_budget_stopper(threshold: Optional[int] = None):
+    """P4.3 闸门二：turn 结束超预算 → 循环优雅停止（reason=should_stop）。
+
+    优先用本轮真实 prompt_tokens（模型窗口口径）；拿不到 usage 时回落到 chars//2 估算。
+    threshold 显式传参＝真实 token 停止线，仅作用在 usage 路径（2026-10-18 改造起；
+    旧「按估算口径生效」已废——估算兜底线恒由 env/默认决定，threshold 不介入，
+    钉板见 tests/angineer-core/test_budget_gates.py 的 explicit_threshold_does_not_reach_est_fallback）。"""
+    est_limit = _budget_stopper_est()
+    token_limit = threshold if threshold is not None else _budget_stopper_tokens()
 
     def should_stop(context: TurnContext) -> bool:
-        return _estimate_tokens(context.messages) > resolved
+        usage = getattr(context, "usage", None) or {}
+        prompt_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+        if isinstance(prompt_tokens, (int, float)) and prompt_tokens > 0:
+            return int(prompt_tokens) > token_limit
+        return _estimate_tokens(context.messages) > est_limit
 
     return should_stop
 
@@ -733,6 +876,7 @@ def build_complex_config(
     sop_loader: Any = None,
     memory: Any = None,
     step_callback: Optional[Any] = None,
+    step_event: Optional[Callable[[Dict[str, Any]], None]] = None,
     max_turns: int = 8,
     max_tokens_est: Optional[int] = None,
     budget_threshold: Optional[int] = None,
@@ -741,10 +885,13 @@ def build_complex_config(
     final_answer_guard: Optional[Any] = None,
     answer_format: Optional[str] = None,
     sop_hint: Optional[str] = None,
+    l4_synth: Optional[Any] = None,
+    enum_context: Optional[str] = None,
 ) -> AgentLoopConfig:
     """P4.1 大题型 agent 循环：QA 三件套 + SOP 执行 + 计算/查表/条件分支。
 
     answer_format 与 build_qa_config 同义（§7.7 注入实验）：非空追加到系统提示词末尾，None 不变。
+    enum_context 与 build_qa_config 同义：枚举题预取候选，空则逐字节不变。
     """
     if tools is None:
         qa_tools = [
@@ -779,6 +926,9 @@ def build_complex_config(
                 config_name=config_name,
                 mode=mode,
             ),
+            # 枚举型任务（L3/L4「列出所有…」）同样需要文档级候选 + 批量读页
+            RetrieverAdapter.doc_search(library_id=library_id, library_ids=library_ids),
+            RetrieverAdapter.doc_read(library_id=library_id, library_ids=library_ids),
         ]
         effective_tools = [
             *qa_tools,
@@ -790,8 +940,12 @@ def build_complex_config(
                 mode=mode,
                 memory=memory,
                 step_callback=step_callback,
+                sop_event=step_event,
                 library_id=library_id,
                 doc_ids=doc_ids,
+                library_ids=library_ids,
+                synth_callback=l4_synth[0] if l4_synth else None,
+                crystallize_callback=l4_synth[1] if l4_synth else None,
             ),
             EngtoolAdapter.from_registry(
                 "calculator",
@@ -833,10 +987,15 @@ def build_complex_config(
     explicit = _build_inline_citation_context(inline_citations or [])
     if explicit:
         system_prompt += "\n\n显式引用证据（用户已确认，优先级最高）：\n" + explicit
+    if enum_context:
+        system_prompt += "\n\n" + str(enum_context).strip()
 
-    complex_followup = _followup_question_enabled()
+    complex_followup = _followup_question_enabled() and _complex_followup_question_enabled()
     if complex_followup:
         system_prompt += FOLLOWUP_QUESTION_RULE
+    else:
+        # L3/L4 默认不加邀请式问句（2026-10-13 业主定）；缺参仍按陈述句引导
+        system_prompt += NO_FOLLOWUP_QUESTION_RULE
 
     # §7.7 注入实验：与 QA 档各追加同一条规则（同一注入文本经穿线同时到达两档）
     if sop_hint:

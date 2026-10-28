@@ -177,6 +177,8 @@ class AgentLoopConfig:
     # 被吞掉的 LLM 失败落点（哨兵 b）：调用方传入列表即可回收"降级继续跑"的失败明细，
     # 评测据此区分"校准过的拒答"与"故障吞错式拒答"（2026-09-06 53 题全灭事故驱动）
     error_sink: Optional[List[str]] = None
+    # 真实 prompt 留痕：仅评测开启（chat SSE 不传，避免把 system/证据整段推给浏览器）
+    capture_prompt: bool = False
 
 
 def _first_token_liveness_default() -> float:
@@ -192,6 +194,20 @@ def _first_token_liveness_default() -> float:
     except ValueError:
         logger.warning("ANGINEER_FIRST_TOKEN_LIVENESS_S 非法值 %r，按默认 90 处理", raw)
         return 90.0
+
+
+def _tool_hallucination_turns_limit() -> int:
+    """幻觉工具名熔断门槛（ANGINEER_TOOL_HALLUCINATION_TURNS，默认 2，0=关）。
+
+    2026-10-25 FinanceBench 实锤：模型自造工具名（空名/「销量」），“工具未注册”
+    错误结果喂回后仍原样重试 6 次，烧光轮次预算、一题未答。连续 N 轮
+    「本轮全部调用未注册」→ 复用预算耗尽的无工具收尾轮，直接基于已有证据作答。
+    混入真实工具的轮把计数清零——只拦纯幻觉空转，不误伤正常重试。
+    """
+    try:
+        return max(0, int(os.getenv("ANGINEER_TOOL_HALLUCINATION_TURNS", "2") or "2"))
+    except (TypeError, ValueError):
+        return 2
 
 
 def _iter_with_liveness(
@@ -290,6 +306,29 @@ def _safe_emit(emit: Optional[Callable[[AgentEvent], None]], event: AgentEvent) 
         logger.warning("emit 回调异常（已忽略）: %s", exc)
 
 
+# 真实 prompt 入库上限（字符）：单题 trace 不能无上限膨胀。超限截断并标记 truncated。
+_PROMPT_TRACE_MAX_CHARS = 200_000
+
+
+def _prompt_messages_for_trace(
+    messages: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """把发给 LLM 的真实 messages 裁成可入库副本（超长截断 + truncated 标记）。"""
+    total = 0
+    out: List[Dict[str, Any]] = []
+    for message in messages:
+        copy = dict(message)
+        content = copy.get("content")
+        text = content if isinstance(content, str) else ("" if content is None else str(content))
+        if total + len(text) > _PROMPT_TRACE_MAX_CHARS:
+            copy["content"] = text[: max(0, _PROMPT_TRACE_MAX_CHARS - total)]
+            out.append(copy)
+            return out, True
+        out.append(copy)
+        total += len(text)
+    return out, False
+
+
 def _run_callback(callback, default, *args):
     """回调异常一律 fail-open（视为未设置/不拦截）并记 warning。"""
     if callback is None:
@@ -318,6 +357,22 @@ def _tool_evidence_present(messages: List[AgentMessage]) -> bool:
     return False
 
 
+def _sop_missing_finalization(messages: List[AgentMessage]) -> bool:
+    """段内是否出现过「SOP 缺参收尾」形态的 sop_execute 工具结果（内容含「缺参」）。
+
+    2026-10-15 reviewed-exam 解剖：标准计算链因缺参/步骤失败收场时，模型按纪律只报缺
+    （无引用），结局被证据闸整答替换为「无证据拒答」。本判定供正文回退保险用（另两条
+    条件：零证据、最后一段）。"""
+    for message in messages:
+        if message.role != "tool":
+            continue
+        if str(getattr(message, "name", "") or "") != "sop_execute":
+            continue
+        if "缺参" in (message.content or ""):
+            return True
+    return False
+
+
 def _last_answer_is_hard_refusal(messages: List[AgentMessage]) -> bool:
     """拒答且非第三档（「供参考」相邻片段）——第三档是 prompt 规则 16 的合法收尾，
     触发定向重试会逼模型把相邻证据改写成答案，正是 2026-09-20 nightly 拒答题
@@ -336,7 +391,8 @@ _INJECTED_USER_PROMPTS = (
     "请先调用检索工具获取证据后再回答",
     "已代为执行知识检索，请基于检索到的证据给出最终答案",
     "已检索到有效证据",
-    "上一段未命中，进入下一段：",
+    "上一段未命中，请重新检索并基于证据作答",   # 现文案（2026-10-14 起）
+    "上一段未命中，进入下一段：",                 # 旧文案：历史会话里可能仍存在，继续跳过
     "轮次预算已用完，请基于已有证据直接给出最终答案",
 )
 
@@ -443,19 +499,36 @@ def _llm_shell_strip_enabled() -> bool:
     return os.environ.get("ANGINEER_LLM_SHELL_STRIP", "1").strip().lower() not in ("0", "false", "off")
 
 
-# LLM 投影 items[] 白名单：模型作答/引用需要的最小面。
-#   text 正文、cite 引用号（规则 17 依赖）、title/doc_title 出处、
-#   rerank_score 相关性分（证据相关性标注链依赖）、page_label 页码（引用展示）。
+# LLM 投影 items[] 白名单：模型作答/引用需要的最小面，也是引擎与前端消费面
+# （同一份 content 供三方读：prompt、守卫/L2 判据/回看指针、前端引用与思考轨迹）。
+#   text 正文、title 出处、rerank_score 相关性分（证据相关性标注链依赖）、
+#   item_id/citation_target_id 前端「证据条目→点击跳原文」的目标 id（旧投影删掉 item_id，
+#   前端 extractToolResultItems 逐条丢、思考轨迹证据列表整条消失）、
+#   doc_id 回看指针键与按文件归并（旧投影删掉后 _item_pointer_keys 整条空）、
+#   entity_type 前端引用类型、score 原始分兜底。
 #   引擎判定只读 text（_tool_evidence_present/_tool_evidence_parts）；
 #   retrieval_policy/fusion_*/table_* 等检索器遥测走 raw/meta 通道供评测（policy_query 读 message.meta），不进 prompt。
-_LLM_ITEM_KEEP_KEYS = ("text", "title", "doc_title", "cite", "rerank_score", "page_label")
+# ⚠️ 2026-10-16 复盘（勿复犯）：本清单曾只按「模型要不要」裁——cite/page_label 提升到顶层、
+#   item_id/doc_id 直接删。同一份 content 的下游（守卫 _valid_markers、agent_policy._has_evidence、
+#   _item_pointer_keys、前端 collectCitationsFromToolMessages/extractToolResultItems）仍按旧形态读，
+#   10-06 起问答引用标记被守卫全量剥除、L2 恒回退 L1、思考轨迹证据条目消失。
+#   增删本清单前先按字段名 grep 全部消费方，只按一方需要裁剪必复发。
+_LLM_ITEM_KEEP_KEYS = (
+    "item_id", "citation_target_id", "entity_type", "doc_id",
+    "text", "title", "rerank_score", "score",
+)
+# metadata 里提升到顶层的键（投影后 metadata 不再随 content 下发，两形态读法并存）
+_LLM_ITEM_HOIST_KEYS = (
+    "doc_title", "doc_id", "cite", "page_label", "page_idx", "section_path", "library_id",
+)
 
 
 def _project_items(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """items[] 逐条投影：只留白名单键（metadata 里的 cite/page_label 提升到顶层）。
+    """items[] 逐条投影：只留白名单键（metadata 里的引用/位置键提升到顶层）。
 
     实测（2026-10-05 生产 chat.sqlite 40 条 tool result）：正文占 29%、外壳占 53%——
-    外壳里的 rerank_score 以 relevance 标签进 text 顶层，metadata 副本对模型是纯重复。
+    外壳里的 rerank_score 以 relevance 标签进 text 顶层，metadata 副本对模型是纯重复；
+    检索器遥测（retrieval_policy/fusion_*）留 raw/meta 通道。
     非 dict 条目原样保留（防御未知工具形态）；无 text 键的条目原样保留（表格/实体形态不猜结构）。
     """
     items = payload.get("items")
@@ -471,7 +544,7 @@ def _project_items(payload: Dict[str, Any]) -> Dict[str, Any]:
         for key in _LLM_ITEM_KEEP_KEYS:
             if key in item:
                 slim[key] = item[key]
-        for key in ("cite", "page_label"):
+        for key in _LLM_ITEM_HOIST_KEYS:
             if key in meta and key not in slim:
                 slim[key] = meta[key]
         projected.append(slim)
@@ -590,6 +663,13 @@ def _timeout_result(call, tool: AgentTool, timeout: int) -> ToolResult:
     )
 
 
+# 只读检索工具超时自动重试（2026-10-14 评测实踩：网关拥塞期 knowledge_search/table_search
+# 整批 120s 超时被吞成零证据 → 守卫按「无证据」替换拒答，eval_1 两题因此判挂）。
+# 给一次更短时限的重试：短暂抖动可自愈，长故障仍如实超时（不改变"超时即如实记录"的口径）。
+_SEARCH_TIMEOUT_RETRY_TOOLS = {"knowledge_search", "table_search"}
+_SEARCH_TIMEOUT_RETRY_SECONDS = 60
+
+
 def _execute_tools_batch(
     calls: List,
     tools_by_name: Dict[str, AgentTool],
@@ -656,7 +736,13 @@ def _execute_tools_batch(
             continue
         validation_error = _validate_arguments(tool.parameters_schema, call.arguments)
         if validation_error:
-            results.append(fail(call, f"参数校验失败: {validation_error}"))
+            message = f"参数校验失败: {validation_error}"
+            # 懒加载：把 schema 直接带回错误结果，模型下一轮可按 schema 重试（不必再单独 tool_schema）
+            if not getattr(config.codec, "include_schemas", True):
+                message += "\n参数 schema: " + json.dumps(
+                    tool.parameters_schema or {}, ensure_ascii=False
+                )
+            results.append(fail(call, message))
             continue
         block_reason = _run_callback(config.before_tool_call, None, tool, call.arguments)
         if block_reason:
@@ -687,6 +773,24 @@ def _execute_tools_batch(
 
         return executor.submit(contextvars.copy_context().run, _run_tool_inner, call, tool, cancel)
 
+    _retried_calls: set = set()
+
+    def _timeout_with_retry(call, tool, first_result):
+        """超时兜底：只读检索工具自动重试一次（更短时限）；其余工具或已重试过则原样返回。"""
+        if tool.name not in _SEARCH_TIMEOUT_RETRY_TOOLS or call.id in _retried_calls:
+            return first_result
+        _retried_calls.add(call.id)
+        retry_timeout = min(timeout, _SEARCH_TIMEOUT_RETRY_SECONDS)
+        _safe_emit(
+            emit,
+            AgentEvent(type="note", run_id=run_id, turn=turn,
+                       payload={"detail": f"工具 {tool.name} 超时（{timeout}s），已自动重试一次（{retry_timeout}s）"}),
+        )
+        try:
+            return _submit_with_context(call, tool).result(timeout=retry_timeout)
+        except FuturesTimeoutError:
+            return _timeout_result(call, tool, retry_timeout)
+
     try:
         for call, tool in pending:
             _safe_emit(
@@ -703,7 +807,7 @@ def _execute_tools_batch(
                 try:
                     result = future.result(timeout=timeout)
                 except FuturesTimeoutError:
-                    result = _timeout_result(call, tool, timeout)
+                    result = _timeout_with_retry(call, tool, _timeout_result(call, tool, timeout))
                 results.append(result)
                 _dur_ms = int((time.monotonic() - started) * 1000)
                 _safe_emit(
@@ -718,7 +822,7 @@ def _execute_tools_batch(
                 try:
                     result = future.result(timeout=timeout)
                 except FuturesTimeoutError:
-                    result = _timeout_result(call, tool, timeout)
+                    result = _timeout_with_retry(call, tool, _timeout_result(call, tool, timeout))
                     # 超时后立即放弃等待；剩余 future 由 shutdown(cancel_futures=True) 取消/泄漏
                 results.append(result)
                 _dur_ms = int((time.monotonic() - started) * 1000)
@@ -766,6 +870,28 @@ def _run_llm_turn(
         {"role": "system", "content": codec.augment_system_prompt(config.system_prompt, config.tools if allow_tools else [])}
     ]
     llm_messages.extend(to_llm_messages(transformed, tool_style=tool_style))
+
+    # 真实 prompt 留痕：调试时能核对模型实际看到的 system/问题/证据，而不是事后重建。
+    # 仅 capture_prompt=True（评测）落事件；chat SSE 不落，避免整段 prompt 推给浏览器。
+    if config.capture_prompt:
+        _prompt_chars = sum(len(str(message.get("content") or "")) for message in llm_messages)
+        _prompt_messages, _prompt_truncated = _prompt_messages_for_trace(llm_messages)
+        _safe_emit(
+            emit,
+            AgentEvent(
+                type="llm_request",
+                run_id=run_id,
+                turn=turn,
+                payload={
+                    "model": config.model or "",
+                    "config_name": config.config_name or "",
+                    "message_count": len(llm_messages),
+                    "prompt_chars": _prompt_chars,
+                    "truncated": _prompt_truncated,
+                    "messages": _prompt_messages,
+                },
+            ),
+        )
 
     _safe_emit(emit, AgentEvent(type="message_start", run_id=run_id, turn=turn, payload={}))
     full_text = ""
@@ -1068,6 +1194,43 @@ class _AttemptMachine:
         attempt = self.attempts[self.active_attempt_idx]
         check = attempt.success_check
         used_tools = any(m.role == "tool" for m in self.messages[self.attempt_start_idx:])
+        # SOP 缺参收尾的正文回退保险（2026-10-15）：SOP 执行因缺参/失败收场且段内零证据时，
+        # 结局会被证据闸整答替换为「无证据拒答」（规定类问题白丢分）。给它一次正文检索
+        # 兜底（一次性）：规定/方法部分可基于证据作答，数值结果仍不臆造（缺参纪律红线不动）。
+        # 放在 ok-判定之前：缺参报告本身大概率能过 success_check，先进 ok 出口就轮不到本保险。
+        if (
+            used_tools
+            and self.active_attempt_idx + 1 >= len(self.attempts)
+            and not self._forced_retrieve_used
+            and self.force_retrieve is not None
+            and not _tool_evidence_present(self.messages[self.attempt_start_idx:])
+            and _sop_missing_finalization(self.messages[self.attempt_start_idx:])
+        ):
+            forced = self.force_retrieve()
+            if forced:
+                result_content, result_raw = forced
+                self._forced_retrieve_used = True
+                self.attempt_turn = max(0, self.attempt_turn - 1)
+                self.messages.append(
+                    AgentMessage(
+                        role="tool",
+                        content=result_content,
+                        tool_call_id="forced_knowledge_search",
+                        name="knowledge_search",
+                        meta=result_raw,
+                    )
+                )
+                self.messages.append(
+                    AgentMessage(
+                        role="user",
+                        content="SOP 因缺参/步骤失败未给出数值结果。已代为执行知识检索：请基于检索到的证据，"
+                        "把规范中的规定/方法/查表要求部分回答出来（这不属于代算）；仍缺的参数照实列出，"
+                        "数值结果不得自行假设。",
+                    )
+                )
+                self.add_note("SOP 缺参收尾且段内零证据，已代为执行 knowledge_search 并要求基于正文证据作答")
+                self.path_trace.append("sop_missing_forced_retrieve")
+                return "retry"
         ok = check is None or bool(_run_callback(check, True, added))
         if ok:
             if not (attempt.requires_tools and not used_tools):
@@ -1145,7 +1308,10 @@ class _AttemptMachine:
         if self.active_attempt_idx + 1 < len(self.attempts):
             nxt = self.attempts[self.active_attempt_idx + 1]
             self.add_note(attempt.fallback_note or f"本段未命中，进入下一段：{nxt.name}")
-            self.messages.append(AgentMessage(role="user", content=f"上一段未命中，进入下一段：{nxt.name}"))
+            # 注入给模型的消息不带段名：段名（如 "L1 语义检索"）是内部标签，2026-10-14 实踩——
+            # 模型把「上一段未命中，进入下一段：L1 语义检索」当问题主题去检索并作答
+            # （eval_1 q_018 tool args 实锤 query="L1 语义检索"）。UI 侧过程说明由 add_note 承载。
+            self.messages.append(AgentMessage(role="user", content="上一段未命中，请重新检索并基于证据作答。"))
             self.apply(self.active_attempt_idx + 1)
             self.attempt_turn = 0
             self.path_trace.append("fallback_next")
@@ -1365,6 +1531,9 @@ def run_agent_loop(
             _add_note("用户取消，停止生成")
         else:
             prev_len = start_idx
+            # 幻觉工具名熔断：连续「本轮调用全部未注册」的轮数 + 已熔断锁（2026-10-25）
+            invalid_tool_turns = 0
+            tools_locked = False
             while True:
                 # 决策点：steer 注入 / should_stop / cancel / max_turns
                 if provider is not None:
@@ -1383,8 +1552,24 @@ def run_agent_loop(
                         _add_note("用户取消，停止生成")
                         break
                     budget = machine.active_config.max_turns if machine.attempts else config.max_turns
-                    if machine.attempt_turn >= budget:
+                    # 无工具收尾轮有两个触发口：轮次预算耗尽 / 幻觉工具名熔断（2026-10-25）——
+                    # 均先追加一条引导 user 消息，再给最后一次 allow_tools=False 的回答轮
+                    halluc_limit = _tool_hallucination_turns_limit()
+                    if halluc_limit and not tools_locked and invalid_tool_turns >= halluc_limit:
+                        tools_locked = True
+                    closing_reason: Optional[str] = None
+                    if tools_locked:
+                        closing_reason = "tool_hallucination_breaker"
+                        _add_note(
+                            f"幻觉工具名熔断：连续 {invalid_tool_turns} 轮调用的工具名均未注册，转入无工具直答"
+                        )
+                        machine.path_trace.append("tool_hallucination_breaker")
+                        messages.append(
+                            AgentMessage(role="user", content="你调用的工具名均未注册，工具已停用。请基于已有证据直接给出最终答案")
+                        )
+                    elif machine.attempt_turn >= budget:
                         # 段预算耗尽：不硬断，追加预算提示后给最后一次无工具收尾 turn
+                        closing_reason = "max_turns"
                         _add_note(
                             f"轮次预算已用完（max_turns={budget}），进入无工具收尾回答"
                         )
@@ -1392,6 +1577,7 @@ def run_agent_loop(
                         messages.append(
                             AgentMessage(role="user", content="轮次预算已用完，请基于已有证据直接给出最终答案")
                         )
+                    if closing_reason:
                         new_prompt = messages[prev_len:]
                         prev_len = len(messages)
                         turn += 1
@@ -1416,11 +1602,14 @@ def run_agent_loop(
                         if machine.attempts:
                             status = machine.advance()
                             if status == "next":
+                                # 下一段是另一套工具/提示词：熔断锁与计数复位，给新段正常用工具的活路
+                                tools_locked = False
+                                invalid_tool_turns = 0
                                 continue
                             if status in ("exhausted", "retry"):
                                 reason = machine.finalize_refusal()
                             break  # completed / exhausted 均已收尾，reason 已维护
-                        reason = "max_turns"
+                        reason = closing_reason
                         break
 
                 turn += 1
@@ -1470,6 +1659,12 @@ def run_agent_loop(
                         reason = "terminated"
                         _add_note("工具返回终止信号，提前结束（terminate）")
                         break
+                    # 幻觉工具名熔断计数：只数「本轮全部调用未注册」的轮；混入真实工具即清零
+                    if not tools_locked:
+                        if all(call.name not in machine.tools_by_name for call in calls):
+                            invalid_tool_turns += 1
+                        else:
+                            invalid_tool_turns = 0
                     continue
 
                 # 无工具调用：模型主动给出最终答案，正常停

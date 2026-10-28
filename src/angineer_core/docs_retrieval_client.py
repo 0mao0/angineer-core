@@ -139,6 +139,79 @@ class DocsRetrievalClient:
             raise RuntimeError(str(data["error"]))
         return list(data.get("entities") or [])
 
+    def doc_search(
+        self,
+        *,
+        query: str,
+        library_id: str = "default",
+        limit: int = 60,
+        per_matter: int = 2,
+        filename_contains: Optional[List[str]] = None,
+        doc_type: Optional[str] = None,
+        sort_by: Optional[str] = None,
+        date_after: Optional[str] = None,
+        date_before: Optional[str] = None,
+        entity_contains: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """文档级检索（/internal/doc-search）：枚举型任务的候选清单（按 matter 归并）。
+
+        sort_by=date_desc/date_asc 按目录文档日期排序；date_after/date_before 为
+        YYYY-MM-DD 闭区间过滤（显式过滤时无日期文档被排除）；entity_contains 先把
+        范围收窄到提到该实体的分组（「某客户最新一份某类文档」一次调用完成）。
+        """
+        resp = requests.post(
+            f"{self.base_url}/api/knowledge/internal/doc-search",
+            json={
+                "query": query,
+                "library_id": library_id,
+                "limit": limit,
+                "per_matter": per_matter,
+                "filename_contains": list(filename_contains or []),
+                "doc_type": doc_type or "",
+                "sort_by": sort_by or "",
+                "date_after": date_after or "",
+                "date_before": date_before or "",
+                "entity_contains": entity_contains or "",
+            },
+            timeout=self.timeout,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"docs-api doc-search status {resp.status_code}")
+        data = resp.json()
+        if data.get("error"):
+            raise RuntimeError(str(data["error"]))
+        return data
+
+    def doc_read(
+        self,
+        *,
+        library_id: str,
+        doc_ids: List[str],
+        query: str = "",
+        max_chars_per_doc: int = 1200,
+        mode: str = "head",
+        section: str = "",
+    ) -> Dict[str, Any]:
+        """批量读页（/internal/doc-read）。section 为章节号（如 "2.15"），从该章节标题开始读。"""
+        resp = requests.post(
+            f"{self.base_url}/api/knowledge/internal/doc-read",
+            json={
+                "library_id": library_id,
+                "doc_ids": list(doc_ids or []),
+                "query": query,
+                "max_chars_per_doc": max_chars_per_doc,
+                "mode": mode,
+                "section": section,
+            },
+            timeout=self.timeout,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"docs-api doc-read status {resp.status_code}")
+        data = resp.json()
+        if data.get("error"):
+            raise RuntimeError(str(data["error"]))
+        return data
+
     def list_doc_nodes(self, library_id: str) -> List[KnowledgeNode]:
         """调用 docs-api /internal/doc-nodes，返回 KnowledgeNode 列表。"""
         resp = requests.get(
@@ -205,9 +278,9 @@ class DocsRetrievalClient:
         return [RetrievedItem.model_validate(item) for item in data.get("candidates") or []]
 
     def relevant_citations(
-        self, query: str, items: List["RetrievedItem"], limit: int = 5
+        self, query: str, items: List["RetrievedItem"], limit: Optional[int] = None
     ) -> List[Dict[str, Any]]:
-        """引用挑选（/api/knowledge/internal/relevant-citations）。"""
+        """引用挑选（/api/knowledge/internal/relevant-citations）：limit=None 返回全部。"""
         resp = requests.post(
             f"{self.base_url}/api/knowledge/internal/relevant-citations",
             json={

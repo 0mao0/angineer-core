@@ -6,6 +6,7 @@ import math
 import os
 import re
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from typing import List, Optional, Tuple, Dict, Any
 
 from angineer_core.base_contracts import SOP, AgentResponse, IntentResult, IntentLevel, ServiceMode, RouteResult
@@ -26,7 +27,7 @@ logger = get_logger(__name__)
 L0_PURE_CHAT_KEYWORDS = ["你好", "您好", "嗨", "hi", "hello", "早上好", "下午好", "晚上好", "早安", "晚安",
                           "谢谢", "感谢", "辛苦了", "再见", "拜拜",
                           "心情", "开心", "难过", "无聊", "累", "烦", "高兴", "生气", "焦虑",
-                          "今天天气", "吃了吗", "在吗", "聊聊天", "闲聊"]
+                          "今天天气", "吃了吗", "在吗", "聊聊天", "闲聊", "笑话"]
 L0_AMBIGUOUS_KEYWORDS = ["你是谁", "你叫什么", "能做什么", "有什么功能", "帮我", "怎么用"]
 L1_KEYWORDS = ["什么是", "是什么", "哪些", "定义", "概念", "组成", "包括", "分为", "划分", "分类", "类型", "位于", "设置", "位置", "在哪里", "宜设置", "应设置", "如何确定", "怎么确定", "怎样确定", "如何定义", "怎么定义", "如何划分", "怎么划分", "简述", "说明", "列举", "阐述", "解释", "原理", "作用", "功能", "特点", "特征", "区别", "异同", "对比", "比较", "差异", "选用", "选型", "适用条件", "适用范围", "影响因素", "注意事项",
                # 废 meta_query 路由（第二步）：统计/计数类问法并入 L1 判据——既补 _has_substantive_content
@@ -55,6 +56,19 @@ STANDARD_CODE_PATTERN = re.compile(
 
 ROUTE_RECALL_TOP_K = 5
 ROUTE_RECALL_MIN_SCORE = 0.02
+
+
+def _route_llm_timeout_s() -> float:
+    """精排 LLM 单次调用预算（秒），``ANGINEER_SOP_ROUTE_LLM_TIMEOUT`` 覆盖。
+
+    无内层预算时精排挂起会烧满 sop_execute 的 loop 级 120s 工具超时才报错
+    （agent_loop 只按 config.tool_timeout_s 掐，不知内部构成）；加内层闸让
+    挂起在 ~30s 走既有「精排失败 → 回 error → 模型转检索」降级路。
+    """
+    try:
+        return max(1.0, float(os.getenv("ANGINEER_SOP_ROUTE_LLM_TIMEOUT", "30")))
+    except ValueError:
+        return 30.0
 
 # 各意图层级的默认升级链：当前路径失败后逐级回退
 DEFAULT_EXECUTION_PLANS: Dict[str, List[str]] = {
@@ -286,6 +300,32 @@ def _is_clause_number_query(query: str) -> bool:
     return bool(_CLAUSE_NUMBER_PATTERN.search(query))
 
 
+# 计算方法问句快路径（2026-10-16，docs/req-calc-method-l2-routing.md）：
+# 「XX怎么计算/如何计算/计算公式是什么」类问句（计算动词 + 题面零数值）问的是方法与公式
+# （规范条款查证，L2），不是执行计算（L3 需具体数值参数 + SOP 承接）。
+# 生产实况：同句 2026-10-04→10-06 被 LLM 从 L1 漂到 L3，L3 链路无 SOP 可执行即缺参/拒答。
+# 刻意窄口径（问句尾巴限定）防误伤；开关 ANGINEER_CALC_METHOD_FASTPATH 默认开。
+_CALC_METHOD_PATTERN = re.compile(
+    r"(?:怎么|如何|怎样)(?:计算|算(?!法)|求解|求|算出|得出|推算)"
+    r"|(?:计算|求解|(?<![寻请要需])求)(?:公式|方法|步骤|过程)\s*"
+    r"(?:是什么|是啥|是多少|怎么样|是怎样的|为多少|为|有哪些|分别|呢|[?？]|$)"
+)
+
+_DIGIT_PATTERN = re.compile(r"[0-9０-９]")
+
+
+def _calc_method_fastpath_enabled() -> bool:
+    return (os.getenv("ANGINEER_CALC_METHOD_FASTPATH", "true") or "").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _is_calc_method_query(query: str) -> bool:
+    if not query:
+        return False
+    if _DIGIT_PATTERN.search(query):
+        return False
+    return bool(_CALC_METHOD_PATTERN.search(query))
+
+
 # L0 闲聊快速检测（独立函数，供 classify_intent 优先调用）
 def _check_l0_intent(query: str) -> Optional[IntentResult]:
     """仅检测明确的闲聊/问候意图，不做 L1-L4 判定。"""
@@ -402,6 +442,17 @@ def _rule_based_classify(query: str) -> Optional[IntentResult]:
     
     has_l1_keyword = any(kw in query for kw in L1_KEYWORDS)
     has_l4_compound = any(kw in query for kw in L4_COMPOUND_SIGNALS)
+
+    # 计算方法问句（无数值参数）→ L2 条款/公式查证（与计算快路径同口径；2026-10-16）
+    # 必须置于 L1 分支之前：L1_KEYWORDS 含「是什么」，否则「计算公式是什么」会被 L1 先截胡（实测）
+    if _calc_method_fastpath_enabled() and _is_calc_method_query(query):
+        return _build_intent_result(
+            intent_level="L2",
+            intent_type="method_lookup",
+            required_capabilities=["retrieval", "sql"],
+            service_mode="structured_lookup",
+            reason="计算方法问句（无数值参数）：规则归 L2 条款/公式查证（计算快路径同口径）",
+        )
     
     # L1: 概念/定义/位置类查询（只要检测到L1关键词且没有强L3信号）
     if has_l1_keyword and not (has_l3_keyword and len(num_values) >= 1):
@@ -537,6 +588,7 @@ class IntentClassifier:
                     "level": getattr(result, "intent_level", None),
                     "mode": getattr(result, "service_mode", None),
                     "query": user_query,
+                    "reason": getattr(result, "reason", None),
                 },
             )
         except Exception:  # noqa: BLE001
@@ -581,6 +633,19 @@ class IntentClassifier:
             )
             logger.info(f"[DEBUG-SOP-ROUTE] 条款号快路径命中: {user_query[:50]}")
             return clause_result
+
+        # 步骤 1.8: 计算方法问句快路径（2026-10-16，docs/req-calc-method-l2-routing.md）
+        # 「堤顶高程怎么计算」类：问方法/公式而非执行计算（题面无数值参数），规则直达 L2。
+        if _calc_method_fastpath_enabled() and _is_calc_method_query(user_query):
+            calc_method_result = _build_intent_result(
+                intent_level="L2",
+                intent_type="method_lookup",
+                required_capabilities=["retrieval", "sql"],
+                service_mode="structured_lookup",
+                reason="计算方法问句快路径：似查公式/方法而非执行计算（无数值参数），规则直达 L2",
+            )
+            logger.info(f"[DEBUG-SOP-ROUTE] 计算方法问句快路径命中: {user_query[:50]}")
+            return calc_method_result
 
         # 步骤 2: LLM 直接分类 L1/L2/L3/L4（主力分类器）
         logger.debug("[DEBUG-SOP-ROUTE] 非L0查询，进入 LLM 主力分类...")
@@ -743,15 +808,35 @@ class IntentClassifier:
 
         try:
             logger.debug("[DEBUG-SOP-ROUTE] 调用 LLM 进行精排...")
-            result = chat_result_guarded(
-                self._llm_client,
-                [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"用户问题: {user_query}"},
-                ],
-                mode=mode,
-                config_name=config_name,
-            )
+            # 内层超时闸（同 sop_runner llm_generate 模式）：网关挂起时内层先超时，
+            # 走下方统一的精排失败降级路，而非烧满 sop_execute 的 120s 工具预算。
+            route_timeout = _route_llm_timeout_s()
+            executor = ThreadPoolExecutor(max_workers=1)
+            try:
+                future = executor.submit(
+                    chat_result_guarded,
+                    self._llm_client,
+                    [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": f"用户问题: {user_query}"},
+                    ],
+                    mode=mode,
+                    config_name=config_name,
+                )
+                result = future.result(timeout=route_timeout)
+            except FuturesTimeoutError:
+                # 超时后立即放弃等待；线程未杀死（泄漏至客户端总超时，与全仓同款限制）
+                logger.warning(
+                    "[DEBUG-SOP-ROUTE] LLM 精排超时（%ss），按精排失败降级（线程未杀死）",
+                    route_timeout,
+                )
+                return RouteResult(
+                    sop=None, args={},
+                    reason=f"LLM精排超时（{route_timeout}s），已降级",
+                    confidence=0.0, candidates=candidates,
+                )
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
             response_text = result.text
             logger.info(f"[DEBUG-SOP-ROUTE] LLM 精排原始响应: {response_text}")
         except Exception as e:

@@ -5,6 +5,7 @@
 """
 import json
 import math
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
@@ -44,6 +45,35 @@ def _get_tool_registry():
 from ai_inference.llm_client import chat_result_guarded, get_llm_client
 
 
+def build_missing_guidance(names: List[str], hints: Any) -> List[Dict[str, Any]]:
+    """缺参 → 引导条目（报缺 + 推荐值 + 理由）。
+
+    业主定纪律（2026-10-13）：缺参数一律「如实报缺 + 引导用户补充 + 给推荐值供确认」，
+    系统绝不代填/臆造。推荐值来自领域包 ``param_recommendations``（参数名 → 条目），
+    无条目的参数只报缺不给数。
+    """
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    rec_map = getattr(hints, "param_recommendations", None) or {}
+    for name in names or []:
+        name = str(name or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        entry = rec_map.get(name) or {}
+        item: Dict[str, Any] = {"param": name}
+        if entry.get("recommend") not in (None, ""):
+            item["recommend"] = entry["recommend"]
+            if entry.get("unit"):
+                item["unit"] = entry["unit"]
+            item["rationale"] = entry.get("rationale") or ""
+            item["source"] = entry.get("source") or "领域包 param_recommendations"
+        else:
+            item["rationale"] = entry.get("rationale") or "请在题面补充该参数（系统不臆造数值）"
+        out.append(item)
+    return out
+
+
 class SopRunner:
     """SOP 步骤执行引擎：blackboard 更新、工具调用、trace 记录与回调。"""
 
@@ -58,6 +88,7 @@ class SopRunner:
         library_id: str = "default",
         doc_ids: Optional[List[str]] = None,
         domain_hints: Optional[DomainHints] = None,
+        library_ids: Optional[List[str]] = None,
     ):
         self.memory = memory or Memory()
         self.config_name = config_name
@@ -67,6 +98,9 @@ class SopRunner:
         self.tool_timeout_s = max(1, int(tool_timeout_s or _TOOL_EXEC_TIMEOUT_SECONDS))
         self.library_id = library_id or "default"
         self.doc_ids = list(doc_ids) if doc_ids else None
+        # 多库并联 scope（表格面，2026-10-13）：SOP 查表/读表跨库扇出；
+        # 旧构造调用不传=单库行为逐位一致
+        self.library_ids = list(library_ids) if library_ids else None
         self.domain_hints = domain_hints or EMPTY_HINTS
         self.variable_metadata = {}
         self._step_callback = None
@@ -74,6 +108,19 @@ class SopRunner:
         self.step_durations = {}
         self.summary_durations = {}
         self.tool_durations = {}
+        # 缺参引导汇总（失败步收集；run_sop 收尾去重挂黑板 _missing_report）
+        self.missing_report: List[Dict[str, Any]] = []
+        self._step_missing: Dict[str, List[str]] = {}
+        # 「题面可提供参数」白名单（run_sop 起按 SOP required ∪ 领域包推荐表计算；
+        # 未计算时（None）不过滤——独立调用 _attach 的单测场景）
+        self._reported_param_filter: Optional[set] = None
+        # AI 推荐值缓存（同 run 内同名参数只调一次 LLM；值只作建议不进计算）
+        self._ai_rec_cache: Dict[str, Dict[str, Any]] = {}
+        # AI 推荐累计耗时（跨步共享预算）。2026-10-15 实踩：按步调用在慢网关下
+        # 逐次超时把整个 sop_execute 拖爆 120s 工具预算——步骤结果与 sop_flow 帧
+        # 全被超时吞掉（5 个几何缺参 4 次调用 ≈ 11 分钟）。预算内 best-effort，
+        # 超预算/单次超时一律降级「仅报缺」（不臆造），绝不让增强项拖死主结果。
+        self._ai_rec_spent_s: float = 0.0
 
         if self.result_md_path:
             with open(self.result_md_path, "w", encoding="utf-8") as f:
@@ -182,6 +229,16 @@ class SopRunner:
         logger.info(f"[{sop.id}] Starting execution: {sop.description}")
         self._step_callback = step_callback
 
+        # 缺参引导白名单：题面可提供参数 = SOP required ∪ 领域包推荐表
+        try:
+            _bb = getattr(sop, "blackboard", None) or {}
+            _required = {str(x) for x in (_bb.get("required") or [])}
+        except Exception:  # noqa: BLE001
+            _required = set()
+        _recs = set((getattr(self.domain_hints, "param_recommendations", None) or {}).keys())
+        if _required or _recs:
+            self._reported_param_filter = _required | _recs
+
         # Log pre-execution events if provided
         if pre_logs:
             self.log_pre_execution(pre_logs)
@@ -220,6 +277,14 @@ class SopRunner:
                 f.write(f"| 调度开销 | {total_step_overhead:.2f}s | {(total_step_overhead/total_duration)*100:.1f}% |\n")
                 f.write(f"\n> 注: '调度开销' 包含 Python 代码执行、文件 I/O 及其他逻辑处理时间。\n")
         
+        # 缺参引导收尾：去重后挂黑板（消费方：sop_execute 汇总 + 回答拼装）
+        if self.missing_report:
+            dedup: Dict[str, Dict[str, Any]] = {}
+            for item in self.missing_report:
+                dedup.setdefault(str(item.get("param") or ""), item)
+            self.missing_report = [v for k, v in dedup.items() if k]
+            self.memory.update_context({"_missing_report": self.missing_report})
+
         return self.memory.blackboard
 
     def _run_single_step(self, step: Step):
@@ -230,12 +295,183 @@ class SopRunner:
             logger.error(f"Step {step.id} 执行异常，继续后续步骤: {e}")
             self._record_step(step, {}, None, error=f"unhandled: {e}")
 
+        # 失败步：挂「报缺 + 推荐值」引导（业主纪律：缺参不臆造，给引导）
+        if self._step_failed(step):
+            self._attach_missing_guidance(step)
+
         if self._step_callback:
             step_info = self._build_step_info(step)
             try:
                 self._step_callback(step_info)
             except Exception as e:
                 logger.warning(f"step_callback 调用失败: {e}")
+
+    @staticmethod
+    def _collect_unresolved_names(value: Any, acc: Optional[List[str]] = None) -> List[str]:
+        """递归收集未解析的 ${name} 模板变量名（dict/list 嵌套同样扫描）。"""
+        if acc is None:
+            acc = []
+        if isinstance(value, str):
+            for name in re.findall(r"\$\{([^}]+)\}", value):
+                if name not in acc:
+                    acc.append(name)
+        elif isinstance(value, dict):
+            for item in value.values():
+                SopRunner._collect_unresolved_names(item, acc)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                SopRunner._collect_unresolved_names(item, acc)
+        return acc
+
+    def _ai_rec_budget_s(self) -> float:
+        """同 run AI 推荐总预算（秒，跨步共享）；``ANGINEER_SOP_AI_RECOMMEND_TIMEOUT`` 覆盖。"""
+        try:
+            return max(0.0, float(os.getenv("ANGINEER_SOP_AI_RECOMMEND_TIMEOUT", "30")))
+        except ValueError:
+            return 30.0
+
+    def _llm_recommend(self, names: List[str], step: Step) -> Dict[str, Dict[str, Any]]:
+        """静态推荐表未覆盖的参数：AI 现场生成推荐值（受约束）。
+
+        - 来源标注 ``ai``，与领域包静态值区分（业主可审、可随时挪进静态表）；
+        - 提示词硬约束：无可靠依据必须 recommend=null 只讲获取途径；
+        - 推荐值只作建议、绝不自动进计算；LLM 失败/超时静默降级为「仅报缺」。
+        - 预算：跨步共享 ``ANGINEER_SOP_AI_RECOMMEND_TIMEOUT``（默认 30s），
+          单次等待与累计均不得超出，保证 sop_execute 不被增强项拖爆工具超时。
+        开关：``ANGINEER_SOP_AI_RECOMMEND=0`` 关闭。
+        """
+        if os.getenv("ANGINEER_SOP_AI_RECOMMEND", "1").strip() in ("0", "false", "False", "off"):
+            return {}
+        client = self._llm_client
+        if client is None or not names:
+            return {}
+        remaining = self._ai_rec_budget_s() - self._ai_rec_spent_s
+        if remaining <= 1.0:
+            logger.info(
+                "AI 推荐预算已用尽（累计 %.1fs），降级为仅报缺: %s",
+                self._ai_rec_spent_s, names,
+            )
+            return {}
+        known = {
+            k: v for k, v in (self.memory.blackboard or {}).items()
+            if not str(k).startswith("_") and v not in (None, "")
+        }
+        query = str(known.get("user_query") or "")
+        known_desc = json.dumps(known, ensure_ascii=False, default=str)[:800]
+        param_defs = dict(getattr(self.domain_hints, "param_descriptions", None) or {})
+        step_desc = ""
+        try:
+            d = step.description
+            step_desc = (d.get("content") if isinstance(d, dict) else str(d)) or ""
+        except Exception:  # noqa: BLE001
+            pass
+        names_lines = []
+        for name in names:
+            line = f"- {name}"
+            if param_defs.get(name):
+                line += f"：{param_defs[name]}"
+            names_lines.append(line)
+        prompt = (
+            "你是水运/海港工程规范助手。某计算流程缺少以下参数，请逐一给出【推荐取值】供用户确认。\n"
+            f"当前步骤：{step.name or step.id}——{step_desc[:200]}\n"
+            "严格要求：\n"
+            "1. 先确认参数在本步骤中的物理含义（见下方参数释义与步骤描述），含义无法确定的 recommend 必须为 null；\n"
+            "2. 只推荐你能给出可靠依据的值；**禁止编造规范条文号**——引用具体条文必须确有把握，"
+            "否则 rationale 写明「工程常规（未核规范）」；\n"
+            "3. 推荐值只是建议，不会自动参与计算，用户确认后才生效；\n"
+            "4. 只输出严格 JSON（不要任何其它文字）：\n"
+            '{"参数名": {"recommend": <数值或短字符串或null>, "unit": "<单位或空串>", '
+            '"rationale": "<一句话：先写该参数的物理含义，再写取值依据>", "confidence": "high|medium|low"}}\n\n'
+            f"题面：{query[:600]}\n"
+            f"已知参数：{known_desc}\n"
+            "缺失参数（含释义）：\n" + "\n".join(names_lines) + "\n"
+        )
+        started = time.time()
+        executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            future = executor.submit(
+                chat_result_guarded,
+                client,
+                [{"role": "user", "content": prompt}],
+                mode=self.mode,
+                config_name=self.config_name,
+                max_tokens=600,
+            )
+            result = future.result(timeout=remaining)
+            raw = (result.text or "").strip()
+            start, end = raw.find("{"), raw.rfind("}")
+            data = json.loads(raw[start:end + 1]) if 0 <= start < end else {}
+        except FuturesTimeoutError:
+            logger.warning(
+                "AI 推荐生成超时（预算 %.1fs），降级为仅报缺（不臆造）: %s", remaining, names,
+            )
+            return {}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("AI 推荐值生成失败（降级为仅报缺，不臆造）: %s", exc)
+            return {}
+        finally:
+            # 超时后放弃等待（禁止 with 默认 wait=True；线程未杀死，如实记录限制）
+            self._ai_rec_spent_s += time.time() - started
+            executor.shutdown(wait=False)
+        out: Dict[str, Dict[str, Any]] = {}
+        for name in names:
+            entry = data.get(name)
+            if not isinstance(entry, dict):
+                continue
+            item: Dict[str, Any] = {"param": name}
+            if entry.get("recommend") not in (None, ""):
+                item["recommend"] = entry["recommend"]
+                if entry.get("unit"):
+                    item["unit"] = str(entry["unit"])
+            item["rationale"] = str(entry.get("rationale") or "")
+            item["source"] = "ai（模型推荐，仅供参考）"
+            if entry.get("confidence"):
+                item["confidence"] = str(entry["confidence"])
+            out[name] = item
+        return out
+
+    def _attach_missing_guidance(self, step: Step):
+        """失败步收集缺参（未解析模板 + 计算器 unknowns）→ 生成引导并汇总。
+
+        只对「题面可提供参数」（SOP blackboard.required ∪ 领域包推荐表）出引导；
+        中间变量（c_ratio/η/E0 等上游计算产物）仅保留 missing_params 审计字段，不进报告。
+        静态表命中的参数用领域包推荐值；未命中的交 AI 现场生成（标注来源，可关）。
+        """
+        names = list(self._step_missing.get(step.id) or [])
+        record = None
+        for r in reversed(self.memory.history):
+            if r.step_id == step.id:
+                record = r
+                break
+        if record is not None and isinstance(record.outputs, dict):
+            for key in ("unknowns", "missing_params"):
+                for unknown in record.outputs.get(key) or []:
+                    if unknown and str(unknown) not in names:
+                        names.append(str(unknown))
+        if not names:
+            return
+        reportable = names
+        if getattr(self, "_reported_param_filter", None):
+            reportable = [n for n in names if n in self._reported_param_filter]
+        if record is not None:
+            payload = record.outputs if isinstance(record.outputs, dict) else {}
+            payload["missing_params"] = names
+            record.outputs = payload
+        if not reportable:
+            return
+        static_map = getattr(self.domain_hints, "param_recommendations", None) or {}
+        guidance = build_missing_guidance(reportable, self.domain_hints)
+        unmapped = [n for n in reportable if n not in static_map]
+        fresh = [n for n in unmapped if n not in self._ai_rec_cache]
+        if fresh:
+            self._ai_rec_cache.update(self._llm_recommend(fresh, step))
+        guidance = [
+            self._ai_rec_cache.get(item["param"], item) if item["param"] in unmapped else item
+            for item in guidance
+        ]
+        if record is not None and isinstance(record.outputs, dict):
+            record.outputs["missing_guidance"] = guidance
+        self.missing_report.extend(guidance)
 
     def _pick_next_step(self, step: Step, sop: SOP, executed_ids: set) -> Optional[Step]:
         """决定下一个执行的步骤（按契约优先级）：
@@ -293,6 +529,46 @@ class SopRunner:
                 return step
         return None
 
+    def _step_param_bindings(self, step: Step) -> Dict[str, Any]:
+        """步骤参数绑定快照（面板展示用）：模板里的 ${名} → 当前黑板值；未解析的给 None。
+
+        2026-10-16 业主需求：聊天面板不只标红，绿步也要能看见「参数和参数值」。
+        名字取自步骤定义模板（inputs 里的 ${}），值取执行后的黑板（同一步产出的键
+        不会在此刻被覆写，取值即该步实际代入值）。
+        """
+        try:
+            names = self._collect_unresolved_names(step.inputs or {})
+        except Exception:  # noqa: BLE001
+            return {}
+        bindings: Dict[str, Any] = {}
+        for name in names:
+            try:
+                val = self.memory.resolve_value("${" + name + "}")
+            except Exception:  # noqa: BLE001
+                val = None
+            # 未解析返回字面模板串 → 记 None（缺失），与「缺什么报什么」口径一致
+            if isinstance(val, str) and val.strip() == "${" + name + "}":
+                val = None
+            if isinstance(val, (dict, list)):
+                val = None  # 展示层只收标量，复杂结构不塞快照
+            bindings[name] = val
+        return bindings
+
+    @staticmethod
+    def _compact_step_result(outputs: Any) -> Any:
+        """步骤结果标量快照（展示用）：工具结果里的 result 字段，标量才带、长串截断。"""
+        if not isinstance(outputs, dict):
+            val: Any = outputs if isinstance(outputs, (int, float, bool)) else None
+        else:
+            val = outputs.get("result")
+        if isinstance(val, bool) or val is None:
+            return val
+        if isinstance(val, (int, float)):
+            return val
+        if isinstance(val, str):
+            return val if len(val) <= 200 else val[:200] + "…"
+        return None
+
     def _build_step_info(self, step: Step) -> Dict[str, Any]:
         """构建单个步骤的执行信息，用于回调通知。"""
         history = getattr(self.memory, "history", [])
@@ -310,6 +586,8 @@ class SopRunner:
             "description": step.description_zh or (step.description.content if step.description else ""),
             "inputs": (record.inputs if record else step.inputs) or {},
             "outputs": (record.outputs if record else None),
+            "bindings": self._step_param_bindings(step),
+            "result": self._compact_step_result(record.outputs if record else None),
             "duration": step_durations.get(step.id, 0.0),
             "status": (record.status if record else "pending"),
             "error": (record.error if record else None),
@@ -378,19 +656,22 @@ class SopRunner:
             
         missing_params = []
         ready_inputs = {}
-        
+
         # 1. Resolve Inputs
         for param_name, value_expr in step.inputs.items():
             resolved_value = self.memory.resolve_value(value_expr)
             ready_inputs[param_name] = resolved_value
-            
+
             # Simple check: if resolved value looks like an unresolved template or None
             if resolved_value is None:
                  missing_params.append(f"{param_name} (value is None)")
-            elif isinstance(resolved_value, str) and "${" in resolved_value:
-                 # Check if it's an unresolved reference
-                 # This is a heuristic, but often useful
-                 missing_params.append(f"{param_name} (unresolved: {resolved_value})")
+
+        # 1.2 递归扫未解析模板（嵌套 dict/list 也要扫——曾漏查 query_conditions 里的
+        # ${船舶航速}，缺参既没进报告也没走「禁 LLM 代算」分支；2026-10-13）
+        unresolved_names = self._collect_unresolved_names(ready_inputs)
+        self._step_missing[step.id] = list(unresolved_names)
+        for name in unresolved_names:
+            missing_params.append(f"unresolved: {name}")
 
         # 1.5. 检查所有输入是否有效（非空），避免将空值传递给工具
         non_auto_tools = {"calculator", "table_lookup", "table_read", "knowledge_search", "user_input"}
@@ -409,15 +690,26 @@ class SopRunner:
 
         # 1.6. Try to derive missing variables from context (K1, 折减系数, etc.)
         if missing_params and step.tool == "calculator":
-            logger.debug(f"Missing calculator params, will rely on LLM: {missing_params}")
+            logger.debug(f"Calculator step missing params（将按缺参口径处理）: {missing_params}")
 
         # 2. Decision Logic
         needs_llm = False
         reason = ""
-        
+
+        # 显式确定性工具 + 缺参：直接执行让工具如实报错，不交给 LLM 代算。
+        # 反例（2026-10-13 实踩）：题面缺「航速」时，缺参触发智能执行，LLM 在
+        # execute_tool 的 calculator 表达式里自补 c=0 算得 W=261.73——编造的中间值
+        # 经 outputs 映射进黑板，最终以「SOP 计算结果」呈现（比失败更糟）。
+        # 口径：calculator/table_read/table_lookup/conditional 的缺参 = 显式失败（缺什么报什么）。
+        _deterministic_tools = {"calculator", "table_read", "table_lookup", "conditional"}
         if missing_params:
-            needs_llm = True
-            reason = f"Missing parameters: {missing_params}"
+            if step.tool in _deterministic_tools:
+                logger.info(
+                    f"[Step {step.id}] 缺参 {missing_params}，显式工具 {step.tool} 直接执行（如实报错，禁 LLM 代算）"
+                )
+            else:
+                needs_llm = True
+                reason = f"Missing parameters: {missing_params}"
         elif step.tool == "auto":
             needs_llm = True
             reason = "Tool is 'auto'"
@@ -492,18 +784,29 @@ class SopRunner:
             "items": items,
         }
 
-    def _run_canonical_table_lookup(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+    def _run_canonical_table_lookup(self, inputs: Dict[str, Any], step: Optional[Step] = None) -> Dict[str, Any]:
         """table_lookup 的 canonical 实现：scope 取构造期注入的 library/doc_ids，
-        存量 SOP 写死的 file_name 由引擎侧转译为 doc_ids（老 SOP 零改动）。"""
+        存量 SOP 写死的 file_name 由引擎侧转译为 doc_ids（老 SOP 零改动）。
+
+        单输出键（如 outputs={"T": "result"}）且未显式给 target_column 时，用输出键
+        反推目标列——否则查表返回整行 map，步骤输出把整行当标量，calculator 会报非法表达式。
+        """
         from angineer_core.canonical_table_lookup import canonical_table_lookup
+
+        target_column = inputs.get("target_column")
+        if not target_column and step is not None and isinstance(step.outputs, dict):
+            result_keys = [key for key, path in step.outputs.items() if path == "result"]
+            if len(result_keys) == 1:
+                target_column = result_keys[0]
 
         return canonical_table_lookup(
             table_name=str(inputs.get("table_name") or ""),
             query_conditions=inputs.get("query_conditions"),
-            target_column=inputs.get("target_column"),
+            target_column=target_column,
             library_id=self.library_id,
             doc_ids=self.doc_ids,
             file_name=inputs.get("file_name"),
+            library_ids=self.library_ids,
         )
 
     # 执行元 SOP 内置工具（llm_generate / knowledge_search-canonical / table_lookup-canonical）
@@ -511,7 +814,7 @@ class SopRunner:
         if tool_name == "knowledge_search":
             return self._run_canonical_knowledge_search(str(inputs.get("query") or ""))
         if tool_name == "table_lookup":
-            return self._run_canonical_table_lookup(inputs)
+            return self._run_canonical_table_lookup(inputs, step)
         if tool_name == "table_read":
             # 读表判读通道（方案 B）：矩阵/双层表头表专用；选表确定性、取值一次 LLM 抽取
             from angineer_core.canonical_table_lookup import canonical_table_read
@@ -525,6 +828,7 @@ class SopRunner:
                 file_name=inputs.get("file_name"),
                 config_name=self.config_name,
                 mode=self.mode,
+                library_ids=self.library_ids,
             )
         if tool_name == "llm_generate":
             messages = []
@@ -600,6 +904,8 @@ class SopRunner:
                 # conditional 的 table_lookup 分支走 canonical 精确查表，scope 经 context 注入
                 run_kwargs.setdefault("library_id", self.library_id)
                 run_kwargs.setdefault("doc_ids", self.doc_ids)
+                if self.library_ids:
+                    run_kwargs.setdefault("library_ids", self.library_ids)
             if self.config_name:
                 run_kwargs["config_name"] = self.config_name
             if self.mode:
@@ -961,7 +1267,12 @@ class SopRunner:
             # If result_path is "result", extract the 'result' field from dict
             elif result_path == "result":
                 if isinstance(result, dict) and "result" in result:
-                    val = result["result"]
+                    inner = result["result"]
+                    # 单输出键 + 整行 map：优先取同名键，避免把整行 dict 当标量塞进 calculator
+                    if isinstance(inner, dict) and context_key in inner:
+                        val = inner[context_key]
+                    else:
+                        val = inner
                 elif isinstance(result, dict) and context_key in result:
                     val = result[context_key]
                 else:
@@ -1274,6 +1585,8 @@ class SopRunner:
                 "description": step.description_zh or (step.description.content if step.description else ""),
                 "inputs": (record.inputs if record else step.inputs) or {},
                 "outputs": (record.outputs if record else None),
+                "bindings": (runner._step_param_bindings(step) if hasattr(runner, "_step_param_bindings") else {}),
+                "result": SopRunner._compact_step_result(record.outputs if record else None),
                 "duration": step_durations.get(step.id, 0.0),
                 "status": (record.status if record else "pending"),
                 "error": (record.error if record else None),

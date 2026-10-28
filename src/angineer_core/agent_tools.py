@@ -209,6 +209,47 @@ class ToolResult:
     raw: Dict[str, Any] = field(default_factory=dict)  # citations 等，进 meta 不进 content
 
 
+class ToolSchemaAdapter:
+    """懒加载元工具：按名称返回目标工具的完整参数 schema。
+
+    system 只暴露 name+description；模型第一次要用某个工具、又不确定参数时，
+    先调 tool_schema(name) 取 schema，再按 schema 调目标工具。schema 会留在
+    对话历史里，后续轮次复用。
+    """
+
+    @staticmethod
+    def tool_schema(tools: List[AgentTool]) -> AgentTool:
+        def handler(name: str = "", **_kwargs: Any) -> Dict[str, Any]:
+            target = next((tool for tool in tools if tool.name == name), None)
+            if target is None:
+                return {
+                    "error": f"未知工具: {name}",
+                    "available": [tool.name for tool in tools],
+                }
+            return {
+                "name": target.name,
+                "description": target.description,
+                "parameters": target.parameters_schema,
+            }
+
+        return AgentTool(
+            name="tool_schema",
+            description=(
+                "获取工具的完整参数 schema。调用工具前若不确定参数名/类型，先调用本工具；"
+                "参数校验失败时也会返回 schema。参数 name=目标工具名。"
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "目标工具名"},
+                },
+                "required": ["name"],
+            },
+            handler=handler,
+            read_only=True,
+        )
+
+
 def _default_schema() -> Dict[str, Any]:
     return {"type": "object", "properties": {}}
 
@@ -884,10 +925,11 @@ def _assemble_search_result(
     return result
 
 
-def _build_relevant_citations(query: str, items: list, limit: int = 5) -> List[Dict[str, Any]]:
-    """从融合候选中挑选"真正有用"的引用：经 relevant_citations 端口消费（docs-core 适配器）。
+def _build_relevant_citations(query: str, items: list, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    """从融合候选中挑选引用：经 relevant_citations 端口消费（docs-core 适配器）。
 
-    未注册时降级为不返回引用（结果仍带 items/evidences，引用是增强字段）。
+    limit=None 时返回全部带 cite 的条目——引用解析表必须覆盖答案可能使用的所有标记
+    （2026-10-22：limit=5 时答案引用 K6+ 导致前端回退显示 doc_id）。未注册时降级为空引用。
     """
     if not items:
         return []
@@ -898,6 +940,16 @@ def _build_relevant_citations(query: str, items: list, limit: int = 5) -> List[D
         logger.warning("relevant_citations 端口未注册（组装层应注入 docs-core 适配器），跳过引用挑选")
         return []
     return citations_fn(query, items, limit)
+
+
+def _client_from_env():
+    """docs-api HTTP client（未配置 ANGINEER_DOCS_API_URL 时返回 None）。"""
+    try:
+        from angineer_core.docs_retrieval_client import client_from_env
+
+        return client_from_env()
+    except Exception:  # noqa: BLE001 —— 配置/导入失败按「无 HTTP 通道」处理，回落进程内
+        return None
 
 
 class RetrieverAdapter:
@@ -976,6 +1028,193 @@ class RetrieverAdapter:
                     },
                 },
                 "required": ["query"],
+            },
+            handler=handler,
+            read_only=True,
+        )
+
+    @staticmethod
+    def doc_search(
+        *,
+        library_id: str = "default",
+        library_ids: Optional[List[str]] = None,
+        retrieval_client: Any = None,
+    ) -> AgentTool:
+        """文档级检索工具（枚举型任务）：返回按 matter 归并的候选文档清单。
+
+        与 knowledge_search 的分工：knowledge_search 是「段落级 top-k」，适合定位一处
+        条款/定义；doc_search 是「文档级全库覆盖」，适合「列出全部/每一个」的穷举题——
+        它把 FTS 命中聚合到文档、再按 matter 归并，模型能看到候选全集而不是前 20 段。
+        """
+        def handler(
+            query: Optional[str] = None,
+            limit: int = 40,
+            per_matter: int = 2,
+            filename_contains: Optional[List[str]] = None,
+            doc_type: Optional[str] = None,
+            sort_by: Optional[str] = None,
+            date_after: Optional[str] = None,
+            date_before: Optional[str] = None,
+            entity_contains: Optional[str] = None,
+            **_kwargs: Any,
+        ) -> Dict[str, Any]:
+            if not query and not filename_contains and not entity_contains:
+                return {"error": "缺少 query 参数（或 filename_contains / entity_contains）"}
+            lib = (library_ids or [library_id])[0]
+            client = retrieval_client or _client_from_env()
+            if client is not None:
+                try:
+                    return client.doc_search(
+                        query=query or "",
+                        library_id=lib,
+                        limit=int(limit or 40),
+                        per_matter=int(per_matter or 2),
+                        filename_contains=filename_contains,
+                        doc_type=doc_type,
+                        sort_by=sort_by,
+                        date_after=date_after,
+                        date_before=date_before,
+                        entity_contains=entity_contains,
+                    )
+                except Exception as exc:  # noqa: BLE001 —— HTTP 失败回落进程内
+                    logger.warning("doc_search HTTP 失败，回落进程内: %s", exc)
+            try:
+                from docs_core.step09_query.doc_search import search_documents
+
+                return search_documents(
+                    library_id=lib,
+                    query=query or "",
+                    limit=int(limit or 40),
+                    per_matter=int(per_matter or 2),
+                    filename_contains=filename_contains,
+                    doc_type=doc_type,
+                    sort_by=sort_by,
+                    date_after=date_after,
+                    date_before=date_before,
+                    entity_contains=entity_contains,
+                )
+            except Exception as exc:  # noqa: BLE001
+                return {"error": f"文档级检索不可用: {exc}"}
+
+        return AgentTool(
+            name="doc_search",
+            description=(
+                "文档级检索：把全库命中的段落聚合到文档，并按 group 分组（group_kind=case/folder/doc："
+                "法律库按案件、有目录的库按目录、散文件一篇一组；法律库的 matter 就是 case，"
+                "卡片仍返回 matter_id），返回候选清单（标题、分组、命中片段）。"
+                "用于「列出所有/每一个/全部…」的穷举类问题——先用它拿候选全集"
+                "（total_groups 是候选组数，group_kinds 给出各类型组数），再用 doc_read 批量读页确认。"
+                "问「某客户/某案件最新一份某类文档」时一次调用：entity_contains=客户名、"
+                "filename_contains=[文档类型]、sort_by=date_desc；entity_contains 会先把范围收窄到"
+                "提到该实体的案件，再在案件内按日期取最新。"
+                "问「最新/最近/哪一年/多少笔（按时间）」时用 sort_by=date_desc：按文档日期降序，"
+                "空日期排最后，卡片带 doc_date（YYYY-MM-DD）与 date_source（text/filename/mtime）；"
+                "可用 date_after/date_before（YYYY-MM-DD）限定区间，显式过滤时无日期文档被排除。"
+                "filename_contains 是目录谓词：按文件名/路径/首屏标题短语过滤（如 [\"second request\"]），"
+                "命中的卡片带 catalog_hit=true 与 matched_docs，是比语义检索更确定的信号，优先核对。"
+                "query 默认 40 篇、最多 120；per_matter 默认 2。"
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "检索词，如「HSR second request」「反垄断 二次问询」"},
+                    "entity_contains": {
+                        "type": "string",
+                        "description": "实体/客户/案件名（如「Lumos Analytics」）：先定位提到它的案件，再在案件内检索",
+                    },
+                    "filename_contains": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "目录谓词：文件名/路径必须包含的短语（多个短语为 AND，如 [\"second request\"]）",
+                    },
+                    "doc_type": {"type": "string", "description": "可选：限定扩展名，如 docx/xlsx/pdf"},
+                    "sort_by": {
+                        "type": "string",
+                        "enum": ["date_desc", "date_asc"],
+                        "description": "按文档日期排序；问「最新/最近」用 date_desc（空日期排最后）",
+                    },
+                    "date_after": {"type": "string", "description": "起始日期 YYYY-MM-DD（含当天）"},
+                    "date_before": {"type": "string", "description": "结束日期 YYYY-MM-DD（含当天）"},
+                    "limit": {"type": "integer", "description": "返回文档数，默认 40，最多 120"},
+                    "per_matter": {"type": "integer", "description": "每个 matter 返回的文档数，默认 2"},
+                },
+                "required": [],
+            },
+            handler=handler,
+            read_only=True,
+        )
+
+    @staticmethod
+    def doc_read(
+        *,
+        library_id: str = "default",
+        library_ids: Optional[List[str]] = None,
+        retrieval_client: Any = None,
+    ) -> AgentTool:
+        """批量读页工具：一次读多篇文档的正文（按页），供枚举题逐篇确认资格。"""
+        def handler(
+            doc_ids: Optional[List[str]] = None,
+            query: Optional[str] = None,
+            mode: str = "head",
+            max_chars_per_doc: int = 1200,
+            section: Optional[str] = None,
+            **_kwargs: Any,
+        ) -> Dict[str, Any]:
+            ids = [str(d).strip() for d in (doc_ids or []) if str(d).strip()]
+            if not ids:
+                return {"error": "缺少 doc_ids 参数"}
+            lib = (library_ids or [library_id])[0]
+            client = retrieval_client or _client_from_env()
+            if client is not None:
+                try:
+                    return client.doc_read(
+                        library_id=lib,
+                        doc_ids=ids,
+                        query=str(query or ""),
+                        max_chars_per_doc=int(max_chars_per_doc or 1200),
+                        mode=str(mode or "head"),
+                        section=str(section or ""),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("doc_read HTTP 失败，回落进程内: %s", exc)
+            try:
+                from docs_core.step09_query.doc_search import read_documents
+
+                return read_documents(
+                    library_id=lib,
+                    doc_ids=ids,
+                    query=str(query or ""),
+                    max_chars_per_doc=int(max_chars_per_doc or 1200),
+                    mode=str(mode or "head"),
+                    section=str(section or ""),
+                )
+            except Exception as exc:  # noqa: BLE001
+                return {"error": f"批量读页不可用: {exc}"}
+
+        return AgentTool(
+            name="doc_read",
+            description=(
+                "批量读页：一次读最多 8 篇文档的正文（按页返回，[pN] 是页码）。"
+                "mode=head 从头读（默认），mode=match 只读与 query 相关的段落。"
+                "要找某一条款/章节（如信贷协议的 MFN 条款）时用 section=\"2.15\"："
+                "从该章节标题处开始读，比关键词匹配更准。"
+                "用于枚举题逐篇确认候选文档：先把 doc_search 返回的 doc_id 列表分批读，"
+                "再据正文判断是否满足条件；不要只凭 snippet 下结论。"
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "doc_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "要读的文档 id 列表（来自 doc_search 的 doc_id），一次最多 8 篇",
+                    },
+                    "query": {"type": "string", "description": "mode=match 时的相关段落检索词"},
+                    "section": {"type": "string", "description": "章节号（如 \"2.15\"）：从该章节标题开始读"},
+                    "mode": {"type": "string", "enum": ["head", "match"], "description": "head=从头读；match=读命中段落"},
+                    "max_chars_per_doc": {"type": "integer", "description": "每篇最多读多少字符，默认 1200，最多 4000"},
+                },
+                "required": ["doc_ids"],
             },
             handler=handler,
             read_only=True,
@@ -1062,10 +1301,12 @@ class RetrieverAdapter:
         return AgentTool(
             name="table_search",
             description="在知识库中检索表格、公式与计算依据，返回包含完整行数值的候选条目。"
-                       "查表/取值/数值/尺度/吨级类问题必须优先使用本工具，且 query 必须使用用户原始问题原文，不要改写或添加词汇。",
+                       "查表/取值/数值/尺度/吨级类问题必须优先使用本工具。query 首次用用户原始问题原文；"
+                       "若返回里没有带行数值的表，可按指标名/报表名改写一次再查（如 Cost of sales、"
+                       "Consolidated Statements of Earnings），仍无结果再如实报缺。",
             parameters_schema={
                 "type": "object",
-                "properties": {"query": {"type": "string", "description": "检索问句（使用用户原始问题原文）"}},
+                "properties": {"query": {"type": "string", "description": "检索问句（首次用原文；无行数值时可按指标名改写一次）"}},
                 "required": ["query"],
             },
             handler=handler,
@@ -1111,8 +1352,9 @@ class RetrieverAdapter:
             if entities is None:
                 from angineer_core import ports
 
-                # KG_DB_PATH 回退留在编排层；端口只吃解析好的 db_path
-                graph_db = db_path or os.environ.get("KG_DB_PATH") or None
+                # 图谱已按库分文件（plan-graph-per-library-split）：缺省由端口按
+                # library_id 解析库文件；仅显式传入的 db_path 才覆盖。
+                graph_db = db_path or None
                 local_entities = ports.get_entity_local_search()
                 if local_entities is None:
                     logger.warning("entity_local_search 端口未注册（组装层应注入 docs-core 适配器）")
@@ -1231,10 +1473,12 @@ class StatsAdapter:
             name="knowledge_stats",
             description=(
                 "查询知识库的统计信息：文档总数、各状态/各库分布、上传趋势（近7天/30天/按月）、"
-                "文件格式分布、总页数与平均页数、存储占用，以及文档标题清单（documents.titles，最多 100 条）。"
-                "当用户询问知识库规模、数量、分布、趋势，或问「库里有哪些文章/规范、收录了什么」"
-                "这类标题列举问题时使用：列举类回答直接基于 documents.titles（按问题关键词筛选标题）。"
-                "只在问题问知识库本身时使用；问某篇文档的正文内容/条款原文，请改用 knowledge_search。"
+                "文件格式分布、总页数与平均页数、存储占用，以及 matter 清单（matter_id + 文档数 + 代表文件名，"
+                "有 doc_catalog 的库才有，相当于对目录做一次 ls）。"
+                "只在问题问知识库本身时使用——规模、数量、分布、趋势、有哪些 matter/案件。"
+                "注意：documents.titles 只是按标题排序的前 100 条样本，不是全量文档清单，不要据它下「库里只有这些」的结论；"
+                "问「有哪些文档/收录了什么」请用 doc_search（按文件名/标题/实体过滤并返回候选全集），"
+                "问某篇文档的正文/条款请用 knowledge_search 或 doc_read。"
             ),
             parameters_schema={
                 "type": "object",
@@ -1266,8 +1510,12 @@ class SopRunnerAdapter:
         runner: Any = None,
         memory: Any = None,
         step_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        sop_event: Optional[Callable[[Dict[str, Any]], None]] = None,
         library_id: str = "default",
         doc_ids: Optional[List[str]] = None,
+        library_ids: Optional[List[str]] = None,
+        synth_callback: Optional[Callable[[str], Any]] = None,
+        crystallize_callback: Optional[Callable[[Dict[str, Any], str, str], None]] = None,
     ) -> AgentTool:
         def handler(
             sop_query: Optional[str] = None,
@@ -1279,6 +1527,18 @@ class SopRunnerAdapter:
             query = str(sop_query or "").strip()
             if not query:
                 return {"error": "缺少 sop_query 参数"}
+
+            # 兼容模型两种调用形态（2026-10-13 实踩）：① sop_query=题面原文；
+            # ② sop_query=SOP 名 + args=参数键值（模型自提参）。形态②下题面参数提取整批
+            # 落空（流速/夹角/船宽全缺、Q1 连 H/L/d 都缺，全链失败被证据闸拒答）——
+            # 把 args 展开为「键: 值」行并入提取文本，领域规则正则按「名: 值」可命中。
+            extract_text = query
+            if isinstance(args, dict) and args:
+                extra_lines = "\n".join(
+                    f"{k}: {v}" for k, v in args.items() if v not in (None, "")
+                )
+                if extra_lines and extra_lines not in query:
+                    extract_text = f"{query}\n{extra_lines}"
 
             if classifier is None:
                 from angineer_core.classifier import IntentClassifier
@@ -1304,15 +1564,32 @@ class SopRunnerAdapter:
                 domain_hints = None
 
             route_result = effective_classifier.route(
-                query, config_name=config_name, mode=mode
+                extract_text, config_name=config_name, mode=mode
             )
             selected_sop = route_result.sop
+            l4_synth = False
             if selected_sop is None or route_result.confidence < SOP_ROUTE_CONFIDENCE_THRESHOLD:
-                return {
+                legacy_error = {
                     "error": "未匹配到合适的 SOP",
                     "reason": route_result.reason or "SOP 路由未命中",
                     "confidence": route_result.confidence,
                 }
+                # 精排超时走的是同一 route-miss 出口，但语义是「降级」不是「没匹配」——
+                # 错误文案带上原因，模型与前端思考过程（summary 只渲染 error）才看得见。
+                if "精排超时" in str(route_result.reason or ""):
+                    legacy_error["error"] = "SOP 精排超时，已跳过 SOP 执行；请改用知识检索作答"
+                if synth_callback is None:  # 开关关：早退，与现状逐键一致
+                    return legacy_error
+                synth = synth_callback(query)  # → {"sop": <契约形态 dict>} | None
+                if not isinstance(synth, dict) or not synth.get("sop"):
+                    return {**legacy_error, "l4_synth_attempted": True}
+                from angineer_core.base_contracts import SOP as SopContract
+                try:
+                    selected_sop = SopContract(**synth["sop"])
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("L4 合成 SOP 构造失败: %s", exc)
+                    return {**legacy_error, "l4_synth_attempted": True, "l4_synth_error": str(exc)[:200]}
+                l4_synth = True
 
             from angineer_core.sop_runner import SopRunner
 
@@ -1330,28 +1607,116 @@ class SopRunnerAdapter:
                     library_id=library_id,
                     doc_ids=doc_ids,
                     domain_hints=domain_hints,
+                    library_ids=library_ids,
                 )
 
-            initial_context = {"user_query": query}
+            initial_context = {"user_query": extract_text}
             initial_context.update(route_result.args or {})
             if isinstance(args, dict):
                 initial_context.update(args)
 
-            final_context = executor.run_sop(
-                selected_sop, initial_context, step_callback=step_callback
-            )
+            # SOP 流程图快照通道（2026-10-14 业主需求：聊天里可见 SOP 步骤流）：
+            # plan/step/done 三种快照事件直发前端 SSE，前端只做替换式渲染；
+            # 未接该通道的调用方（评测/REST/池化默认工厂）step_event=None，行为逐位不变。
+            steps_state: List[Dict[str, Any]] = [
+                {
+                    "step_id": st.id,
+                    "step_name": st.name or st.name_zh or st.id,
+                    "tool": st.tool or "auto",
+                    "status": "pending",
+                }
+                for st in (selected_sop.steps or [])
+            ]
+
+            def _emit_flow(running: bool) -> None:
+                if sop_event is None:
+                    return
+                try:
+                    sop_event({
+                        "sop_id": selected_sop.id,
+                        "sop_name": selected_sop.name_zh or selected_sop.name_en or selected_sop.id,
+                        "total": len(steps_state),
+                        "done": sum(1 for s in steps_state if s["status"] != "pending"),
+                        "running": running,
+                        "steps": [dict(s) for s in steps_state],
+                    })
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("sop_flow 快照发送失败（忽略）: %s", exc)
+
+            run_callback: Optional[Callable[[Dict[str, Any]], None]] = step_callback
+            if sop_event is not None:
+                def _flow_notify(info: Dict[str, Any]) -> None:
+                    if step_callback is not None:
+                        step_callback(info)
+                    sid = str(info.get("step_id") or "")
+                    entry = next((s for s in steps_state if s["step_id"] == sid), None)
+                    if entry is None:
+                        entry = {
+                            "step_id": sid,
+                            "step_name": info.get("step_name") or sid,
+                            "tool": info.get("tool") or "auto",
+                            "status": "pending",
+                        }
+                        steps_state.append(entry)
+                    status = str(info.get("status") or "pending")
+                    entry["status"] = (
+                        "success" if status == "success"
+                        else ("pending" if status == "pending" else "failed")
+                    )
+                    if info.get("duration") is not None:
+                        try:
+                            entry["duration_ms"] = int(float(info["duration"]) * 1000)
+                        except (TypeError, ValueError):
+                            pass
+                    if info.get("error"):
+                        entry["error"] = str(info["error"])[:200]
+                    # 参数绑定 + 结果标量（2026-10-16 业主需求：绿步也要看得见参数和值）
+                    if isinstance(info.get("bindings"), dict) and info["bindings"]:
+                        entry["bindings"] = info["bindings"]
+                    if info.get("result") is not None:
+                        entry["result"] = info["result"]
+                    _emit_flow(True)
+
+                _emit_flow(True)  # plan 快照：前端先渲 pending 骨架
+                run_callback = _flow_notify
+            try:
+                final_context = executor.run_sop(
+                    selected_sop, initial_context, step_callback=run_callback
+                )
+            finally:
+                _emit_flow(False)  # done 快照：running=False，步状态已随 steps 逐次回填
             sop_trace = SopRunner._build_sop_trace(executor, selected_sop)
             citations = SopRunner._build_citations_from_sop_trace(executor)
             success_steps = sum(1 for s in sop_trace if s.get("status") == "success")
             failed_steps = sum(1 for s in sop_trace if s.get("status") not in ("success", "pending"))
+            # 缺参汇总（业主纪律 2026-10-13）：如实报缺 + 引导补充 + 推荐值；系统不臆造数值
+            missing_report = list(getattr(executor, "missing_report", None) or [])
+            summary = (
+                f"命中 SOP {selected_sop.id}，执行 {len(sop_trace)} 步，"
+                f"成功 {success_steps} 步，失败 {failed_steps} 步"
+            )
+            if missing_report:
+                segs = []
+                for item in missing_report[:6]:
+                    seg = str(item.get("param") or "")
+                    if item.get("recommend") not in (None, ""):
+                        seg += f"（建议 {item.get('recommend')}{item.get('unit') or ''}）"
+                    segs.append(seg)
+                summary += (
+                    "；缺参：" + "、".join(segs)
+                    + "——请补充后重问（系统不臆造数值，推荐值仅供参考）"
+                )
+            if l4_synth and crystallize_callback is not None and failed_steps == 0 and success_steps > 0:
+                try:
+                    crystallize_callback(synth["sop"], query, summary)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("L4 crystallize 回调失败（不阻断返回）: %s", exc)
             return {
                 "sop_id": selected_sop.id,
                 "sop_name": selected_sop.name_zh or selected_sop.name_en or selected_sop.id,
                 "confidence": route_result.confidence,
-                "summary": (
-                    f"命中 SOP {selected_sop.id}，执行 {len(sop_trace)} 步，"
-                    f"成功 {success_steps} 步，失败 {failed_steps} 步"
-                ),
+                "summary": summary,
+                "missing_report": missing_report,
                 "steps": [
                     {
                         "step_id": s.get("step_id"),
@@ -1365,6 +1730,7 @@ class SopRunnerAdapter:
                 "sop_trace": sop_trace,
                 "citations": citations,
                 "route_reason": route_result.reason or "",
+                "l4_synth": l4_synth,
             }
 
         # 目录可见性（2026-10-12）：模型无从判断「是否命中」——把 published SOP 清单
@@ -1394,8 +1760,8 @@ class SopRunnerAdapter:
             parameters_schema={
                 "type": "object",
                 "properties": {
-                    "sop_query": {"type": "string", "description": "要交给 SOP 路由的问题"},
-                    "args": {"type": "object", "description": "SOP 所需参数"},
+                    "sop_query": {"type": "string", "description": "用户问题的完整原始文字（逐字传入，勿改写、勿只传 SOP 名称）"},
+                    "args": {"type": "object", "description": "可选补充参数（键用题面里的词，如 船宽/航速）；主要参数请留在 sop_query 原文里"},
                 },
                 "required": ["sop_query"],
             },

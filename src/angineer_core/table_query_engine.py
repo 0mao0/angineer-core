@@ -18,9 +18,94 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+def _domain_column_aliases() -> Dict[str, List[str]]:
+    """领域包里的表头别名（吨级→载重吨DWT(t) 等）；未启用领域包时为空。"""
+    try:
+        from angineer_core.sop_domain import load_domain_pack_from_env
+
+        return load_domain_pack_from_env().table_column_aliases or {}
+    except Exception:  # noqa: BLE001 领域包只做提示，不能挡住查表
+        return {}
+
+
+def _condition_synonyms(
+    key: str, aliases: Optional[Dict[str, List[str]]] = None
+) -> List[str]:
+    """领域别名 + 条件键本身；别名优先。
+
+    别名优先的原因：单字母键（T）若先匹配会把「载重吨DWT(t)」里的 t 当成吃水列；
+    「满载吃水」这类领域别名先命中真正的列。
+    """
+    mapping = aliases if aliases is not None else _domain_column_aliases()
+    out: List[str] = []
+    for alias in mapping.get(key, []) or []:
+        alias = str(alias)
+        if alias and alias not in out:
+            out.append(alias)
+    if key and key not in out:
+        out.append(key)
+    return out
+
+
+def _expand_duplicate_headers(
+    headers: List[str], rows: List[List[Any]]
+) -> tuple:
+    """重复表头 + 首行是子表头时，把子表头并进列名并移除该行。
+
+    canonical 解析会把「船舶主要尺度(m)」的 4 个子列压成 4 个同名列，子表头
+    （总长L/型宽B/型深H/满载吃水T）落进 body 首行。不展开就分不清哪列是 T。
+    仅当表头有重复且首行全为非数值文本时启用，避免误吃正常文本数据行。
+    """
+    if not headers or not rows or len(set(headers)) == len(headers):
+        return headers, rows
+    first = rows[0]
+    if not isinstance(first, (list, tuple)) or len(first) < len(headers):
+        return headers, rows
+    if any(_extract_first_number(cell) is not None for cell in first):
+        return headers, rows
+    effective: List[str] = []
+    changed = False
+    for i, header in enumerate(headers):
+        sub = str(first[i]) if i < len(first) else ""
+        if headers.count(header) > 1 and sub and sub != header:
+            effective.append(f"{header} {sub}")
+            changed = True
+        else:
+            effective.append(header)
+    if not changed:
+        return headers, rows
+    return effective, list(rows[1:])
+
+
 def _normalize_text(text: str) -> str:
     """标准化文本用于匹配。"""
     return re.sub(r"\s+", "", (text or "")).lower()
+
+
+_LATEX_GREEK_MAP = {
+    "gamma": "γ", "lambda": "λ", "phi": "φ", "varphi": "φ", "mu": "μ",
+    "alpha": "α", "beta": "β", "theta": "θ", "sigma": "σ", "delta": "δ",
+    "epsilon": "ε", "varepsilon": "ε", "omega": "ω", "rho": "ρ", "eta": "η",
+    "tau": "τ", "pi": "π", "nu": "ν", "kappa": "κ", "psi": "ψ", "zeta": "ζ",
+    "chi": "χ", "xi": "ξ", "Delta": "Δ", "Psi": "Ψ", "Phi": "Φ",
+    "Sigma": "Σ", "Omega": "Ω", "Theta": "Θ",
+}
+
+
+def _strip_latex_symbols(text: str) -> str:
+    """剥离 LaTeX 记号（\\gamma→γ、$_{}$ 等），供表头/目标列名做符号不敏感比对。
+
+    2026-10-18 实踩：目标列「水平波浪力分项系数γP」与表头「水平波浪力分项系数
+    $\\gamma_{P}$」归一化后不相等（γp vs $\\gamma_{p}$）→ 目标列解析失败 → 引擎
+    回落「成对列」兜底，取到相邻的稳定情况列（返回「抗滑」字符串）。
+    """
+    t = str(text or "")
+    t = re.sub(r"\\(?:mathrm|text|mathbf|mathit|mathbf|operatorname)\s*\{([^{}]*)\}", r"\1", t)
+    t = re.sub(r"\\([A-Za-z]+)", lambda m: _LATEX_GREEK_MAP.get(m.group(1), m.group(1)), t)
+    for ch in "$_{}^\\":
+        t = t.replace(ch, "")
+    t = re.sub(r"\s+", "", t)
+    return t.lower()
 
 
 def _normalize_table_ref(text: str) -> str:
@@ -136,24 +221,88 @@ def _parse_range(text: str) -> Optional[tuple]:
     return None
 
 
+def _is_numeric_condition_value(value: Any) -> bool:
+    """判断条件值是否为数值型；含中文的一律按文本处理。
+
+    2026-10-18 实踩：'抛填2层'（文本值含数字）被 _extract_first_number 归为数值条件，
+    过滤时以 2.0 参与列匹配 → 行条件静默失效（表4.3.7 护面块体造型过滤全灭）。
+    """
+    s = str(value).strip()
+    if not s:
+        return False
+    if re.search(r"[\u4e00-\u9fff]", s):
+        return False
+    return _extract_first_number(s) is not None
+
+
+_LEADING_RANGE_RE = re.compile(
+    r"^\s*(?:\d+(?:\.\d+)?\s*(?:[~～—–]|至|-|≤|<=|≥|>=|<|>)|[≤<≥>=])"
+)
+
+
+def _cell_condition_distance(cell_text: Any, target_val: float) -> Optional[float]:
+    """单元格与数值条件的距离；无法解析返回 None。
+
+    区间语义仅当区间符号紧跟开头数字时启用：
+    - '3.1~3.5' → 区间 (3.1, 3.5)，命中返回 0，否则按边界距离 ×10；
+    - '5000(4501~7500)' 这类「首数+括号区间」必须仍按首数 5000 处理（旧口径），
+      否则会把括号里的子区间当成本格数值（2026-10-18 表4.3.24 配对选行实踩：
+      旧逻辑先取首数，区间命中恒不可达 → 横向成对表恒选错行）。
+    """
+    if cell_text is None:
+        return None
+    t = str(cell_text).strip()
+    if not t:
+        return None
+    if _LEADING_RANGE_RE.match(t):
+        rng = _parse_range(t)
+        if rng:
+            if rng[0] <= target_val <= rng[1]:
+                return 0.0
+            return min(abs(target_val - rng[0]), abs(target_val - rng[1])) * 10
+    num = _extract_first_number(t)
+    if num is None:
+        return None
+    return abs(num - target_val)
+
+
+_DIMENSION_PATTERNS = ['航速', '水深', '波长', '周期']
+
+
+def _match_header_variant(header: str, candidate: str) -> bool:
+    """表头与候选列名的变体匹配（含 LaTeX 符号剥离变体）；维度标注列直接跳过。"""
+    header_norm = _normalize_text(header)
+    if any(dim in header_norm for dim in _DIMENSION_PATTERNS) and not re.search(r'\d', header):
+        return False
+    cand_variants = _expand_match_variants(candidate)
+    for extra in _expand_match_variants(_strip_latex_symbols(candidate)):
+        if extra and extra not in cand_variants:
+            cand_variants.append(extra)
+    header_variants = [header_norm]
+    stripped_header = _strip_latex_symbols(header)
+    if stripped_header and stripped_header != header_norm:
+        header_variants.append(stripped_header)
+    for cand_norm in cand_variants:
+        if not cand_norm:
+            continue
+        for header_variant in header_variants:
+            if cand_norm in header_variant or header_variant in cand_norm:
+                return True
+    return False
+
+
 def _find_column_index(headers: List[str], key: str, synonyms: Optional[List[str]] = None) -> Optional[int]:
     """在表头中匹配列索引。跳过维度标注列（如"船舶航速（kn）"）。"""
     if not headers or not key:
         return None
 
-    dimension_patterns = ['航速', '水深', '波长', '周期', '吃水', 'dwt']
-
-    candidates = [key] + (synonyms or [])
+    candidates = list(synonyms or [])
+    if key and key not in candidates:
+        candidates.append(key)
     for candidate in candidates:
-        cand_variants = _expand_match_variants(candidate)
         for idx, header in enumerate(headers):
-            header_norm = _normalize_text(header)
-            # 跳过维度标注列（如 "船舶航速（kn）"）
-            if any(dim in header_norm for dim in dimension_patterns) and not re.search(r'\d', header):
-                continue
-            for cand_norm in cand_variants:
-                if cand_norm and (cand_norm in header_norm or header_norm in cand_norm):
-                    return idx
+            if _match_header_variant(header, candidate):
+                return idx
 
     # 如果没有匹配到，尝试提取关键词进行模糊匹配
     key_parts = re.findall(r'[Z-z]\d*|下沉|富裕|吃水', key)
@@ -165,6 +314,23 @@ def _find_column_index(headers: List[str], key: str, synonyms: Optional[List[str
                     return idx
 
     return None
+
+
+def _find_column_indices_strict(headers: List[str], key: str, synonyms: Optional[List[str]] = None) -> List[int]:
+    """变体匹配的重复列组（不含 key_parts 单字母兜底，避免误含大量无关列）。
+
+    用途：成对列校正的目标列候选（2026-10-18 实踩：'型宽B(m)' 若走 key_parts 兜底
+    会命中所有含 m 的列 → 校正误把目标挪去 总长L(m)）。
+    """
+    if not headers or not key:
+        return []
+    candidates = list(synonyms or [])
+    if key and key not in candidates:
+        candidates.append(key)
+    return [
+        idx for idx, header in enumerate(headers)
+        if any(_match_header_variant(header, candidate) for candidate in candidates)
+    ]
 
 
 def _find_column_indices(headers: List[str], key: str, synonyms: Optional[List[str]] = None) -> List[int]:
@@ -217,6 +383,8 @@ def _score_numeric_fit_for_candidate(cand: Dict[str, Any], conditions: Dict[str,
         return 0
     numeric_targets = []
     for value in conditions.values():
+        if not _is_numeric_condition_value(value):
+            continue
         parsed = _extract_first_number(str(value))
         if parsed is not None:
             numeric_targets.append(parsed)
@@ -224,7 +392,7 @@ def _score_numeric_fit_for_candidate(cand: Dict[str, Any], conditions: Dict[str,
         return 0
     headers = cand.get("headers") or []
     rows = cand.get("rows") or []
-    tonnage_col = _find_column_index(headers, "吨级", ["船舶吨级", "DWT", "GT"])
+    tonnage_col = _find_column_index(headers, "吨级", _condition_synonyms("吨级"))
     if tonnage_col is None:
         return 0
     best_distance = float("inf")
@@ -252,6 +420,85 @@ def _score_numeric_fit_for_candidate(cand: Dict[str, Any], conditions: Dict[str,
     if best_distance <= 10000:
         return 20
     return 5
+
+
+def _probe_range_candidates(
+    candidates: List[Dict[str, Any]],
+    table_name: str,
+    conditions: Dict[str, Any],
+    aliases: Optional[Dict[str, List[str]]] = None,
+) -> List[Dict[str, Any]]:
+    """范围表名（X~Y）：按序探测哪张候选表能真正匹配到行，返回可行表（保序）。
+
+    背景（2026-10-14 评测实踩）：范围表名会把多张子表评分并列（ref 280），旧逻辑只取
+    分最高一张——选中渡船表后文本条件全灭（无「散货船」行）→「未找到符合文本条件的行」
+    → 参数取不到 → SOP 整链缺参拒答。这里用与主流程同语义的文本/数值可行性预探测重排。
+    """
+    text_conditions: Dict[str, Any] = {}
+    numeric_conditions: Dict[str, Any] = {}
+    for k, v in (conditions or {}).items():
+        if _is_numeric_condition_value(v):
+            numeric_conditions[k] = v
+        else:
+            text_conditions[k] = str(v)
+    feasible: List[Dict[str, Any]] = []
+    for cand in candidates:
+        if _range_candidate_has_rows(
+            cand.get("headers") or [],
+            cand.get("rows") or [],
+            cand.get("context") or "",
+            table_name,
+            text_conditions,
+            numeric_conditions,
+            aliases,
+        ):
+            feasible.append(cand)
+    return feasible
+
+
+def _range_candidate_has_rows(
+    headers: List[str],
+    rows: List[List[Any]],
+    context: str,
+    table_name: str,
+    text_conditions: Dict[str, Any],
+    numeric_conditions: Dict[str, Any],
+    aliases: Optional[Dict[str, List[str]]] = None,
+) -> bool:
+    """可行性探测：与主流程同语义的文本过滤 + 数值列可解析性检查（只看有没有，不算距离）。"""
+    filtered = rows
+    if text_conditions:
+        filtered = []
+        for row in rows:
+            ok = True
+            for k, v in text_conditions.items():
+                col_indices = _find_column_indices(headers, k, _condition_synonyms(k, aliases))
+                if col_indices:
+                    if not any(idx < len(row) and _text_condition_matches(row[idx], v) for idx in col_indices):
+                        ok = False
+                        break
+                else:
+                    if _detect_table_range(table_name):
+                        continue
+                    if _text_condition_matches(context, v):
+                        continue
+                    if not _text_condition_matches(" ".join(str(c) for c in row), v):
+                        ok = False
+                        break
+            if ok:
+                filtered.append(row)
+    if not filtered:
+        return False
+    for k in numeric_conditions:
+        idxs = _find_column_indices(headers, k, _condition_synonyms(k, aliases))
+        if not idxs:
+            continue
+        if not any(
+            any(idx < len(row) and (_extract_first_number(row[idx]) is not None or _parse_range(row[idx])) for idx in idxs)
+            for row in filtered
+        ):
+            return False
+    return True
 
 
 def flatten_header_rows(header_rows: List[List[str]]) -> List[str]:
@@ -306,9 +553,12 @@ def query_tables(
         headers = cand.get("headers")
         if headers is None:
             headers = flatten_header_rows(cand.get("header_rows") or [])
+        headers, body_rows = _expand_duplicate_headers(
+            list(headers or []), list(cand.get("rows") or [])
+        )
         normalized_candidates.append({
             "headers": headers,
-            "rows": cand.get("rows") or [],
+            "rows": body_rows,
             "context": cand.get("context") or "",
             "index": idx,
             "doc_id": cand.get("doc_id"),
@@ -316,6 +566,7 @@ def query_tables(
         })
 
     conditions = _parse_query_conditions(query_conditions)
+    aliases = _domain_column_aliases()
 
     name_norm = _normalize_text(table_name)
 
@@ -346,6 +597,13 @@ def query_tables(
     if explicit_candidates:
         explicit_candidates.sort(key=score_candidate, reverse=True)
         target_table = explicit_candidates[0]
+        # 范围表名（X~Y）并列 280 分时不能只取分最高一张：按「能否真正匹配到行」探测重排
+        # （2026-10-14 实踩：表A.0.2-1~14 选中渡船表 → 文本条件全灭 → SOP 整链缺参拒答）。
+        if len(explicit_candidates) > 1 and _detect_table_range(table_name):
+            feasible = _probe_range_candidates(explicit_candidates, table_name, conditions, aliases)
+            if feasible and feasible[0] is not target_table:
+                target_table = feasible[0]
+                trace.append("表格选择策略: 范围表名按行匹配可行性重选")
         explicit_score = _score_table_reference_match(table_name, target_table.get("context", ""))
         if explicit_score >= 300:
             trace.append("表格选择策略: 标题精确匹配")
@@ -427,13 +685,12 @@ def query_tables(
             },
         }
 
-    # 分离文本和数值条件
+    # 分离文本和数值条件（含中文的值一律按文本处理，见 _is_numeric_condition_value）
     numeric_conditions = {}
     text_conditions = {}
     for k, v in conditions.items():
-        val_num = _extract_first_number(str(v))
-        if val_num is not None:
-            numeric_conditions[k] = val_num
+        if _is_numeric_condition_value(v):
+            numeric_conditions[k] = _extract_first_number(str(v))
         else:
             text_conditions[k] = str(v)
 
@@ -446,7 +703,7 @@ def query_tables(
         for row in rows:
             match = True
             for k, v in text_conditions.items():
-                col_indices = _find_column_indices(headers, k, [k])
+                col_indices = _find_column_indices(headers, k, _condition_synonyms(k, aliases))
                 if col_indices:
                     if not any(idx < len(row) and _text_condition_matches(row[idx], v) for idx in col_indices):
                         match = False
@@ -467,50 +724,54 @@ def query_tables(
     if not rows_to_scan:
         return {"error": "未找到符合文本条件的行", "_table_name": table_name, "_table_context": target_table["context"], "_table_headers": headers}
 
-    # 数值条件处理（多条件最佳匹配）
-    col_conditions = {}  # col_idx -> target_value
+    # 数值条件处理（多条件最佳匹配；同一条件键可命中多个成对列，按该行最近的一列取距离）
+    col_cond_groups: Dict[str, Dict[str, Any]] = {}  # key -> {"cols": [...], "value": num}
+    col_conditions: Dict[int, float] = {}  # col_idx -> target_value（供目标列推断排除用）
     header_lookup_conditions = {}  # key -> target_value（没找到列名的）
 
     for k, v in numeric_conditions.items():
-        idx = _find_column_index(headers, k, [k])
-        if idx is not None:
-            col_conditions[idx] = v
-            trace.append(f"条件列匹配: {k} -> Col {idx}, Val {v}")
+        cols = _find_column_indices(headers, k, _condition_synonyms(k, aliases))
+        if cols:
+            col_cond_groups[k] = {"cols": cols, "value": v}
+            for c in cols:
+                col_conditions[c] = v
+            trace.append(f"条件列匹配: {k} -> Col {','.join(str(c) for c in cols)}, Val {v}")
         else:
             header_lookup_conditions[k] = v
             trace.append(f"条件列未匹配(可能是表头查找): {k}={v}")
 
     best_row = None
+    numeric_match_cols: Dict[str, int] = {}  # key -> 命中行上实际用于判距的列
 
-    if col_conditions:
+    if col_cond_groups:
         scored_rows = []
         for row in rows_to_scan:
-            dist = 0
+            dist = 0.0
             valid = True
-            for col_idx, target_val in col_conditions.items():
-                if col_idx >= len(row):
+            row_choice: Dict[str, int] = {}
+            for k, info in col_cond_groups.items():
+                best_cell_dist = None
+                best_cell_col = None
+                for c in info["cols"]:
+                    if c >= len(row):
+                        continue
+                    d = _cell_condition_distance(row[c], info["value"])
+                    if d is None:
+                        continue
+                    if best_cell_dist is None or d < best_cell_dist:
+                        best_cell_dist = d
+                        best_cell_col = c
+                if best_cell_col is None:
                     valid = False
                     break
-                cell_val = _extract_first_number(row[col_idx])
-                if cell_val is None:
-                    rng = _parse_range(row[col_idx])
-                    if rng:
-                        if rng[0] <= target_val <= rng[1]:
-                            dist += 0
-                        else:
-                            dist += min(abs(target_val - rng[0]), abs(target_val - rng[1])) * 10
-                    else:
-                        valid = False
-                        break
-                else:
-                    dist += abs(cell_val - target_val)
-
+                row_choice[k] = best_cell_col
+                dist += best_cell_dist
             if valid:
-                scored_rows.append((dist, row))
+                scored_rows.append((dist, row, row_choice))
 
         if scored_rows:
             scored_rows.sort(key=lambda x: x[0])
-            best_dist, best_row = scored_rows[0]
+            best_dist, best_row, numeric_match_cols = scored_rows[0]
             trace.append(f"最佳行匹配距离: {best_dist}")
         else:
             return {
@@ -551,12 +812,29 @@ def query_tables(
     final_target_col_idx = None
 
     if target_column:
-        final_target_col_idx = _find_column_index(headers, target_column, [target_column])
+        final_target_col_idx = _find_column_index(headers, target_column, _condition_synonyms(target_column, aliases))
+
+        # 成对列校正：目标列名在表头出现多次（重复列组）时，必须取「条件命中列」的
+        # 配对列（j+1），否则会取到另一组同名列（2026-10-18 表4.3.24 实踩：
+        # 右半区 Vmax 命中第 2 组，目标「护底块石稳定重量W」却解析到第 1 组列）。
+        target_col_candidates = _find_column_indices_strict(headers, target_column, _condition_synonyms(target_column, aliases))
+        if len(target_col_candidates) > 1:
+            matched_cols: List[int] = []
+            for key, value in text_conditions.items():
+                for idx in _find_column_indices(headers, key, _condition_synonyms(key, aliases)):
+                    if idx < len(best_row) and _text_condition_matches(best_row[idx], value):
+                        matched_cols.append(idx)
+            matched_cols.extend(numeric_match_cols.values())
+            for m in matched_cols:
+                if m + 1 in target_col_candidates:
+                    final_target_col_idx = m + 1
+                    trace.append(f"成对列目标列校正: {m} -> {m + 1}（{headers[m + 1]}）")
+                    break
 
     # 对 "条件列-结果列" 成对出现的横向表，优先返回命中的相邻数值列
     if final_target_col_idx is None and text_conditions:
         for key, value in text_conditions.items():
-            candidate_indices = _find_column_indices(headers, key, [key])
+            candidate_indices = _find_column_indices(headers, key, _condition_synonyms(key, aliases))
             for idx in candidate_indices:
                 if idx < len(best_row) and _text_condition_matches(best_row[idx], value):
                     if idx + 1 < len(best_row):
@@ -601,7 +879,7 @@ def query_tables(
         all_indices = set(range(len(headers)))
         used_indices = set(col_conditions.keys())
         for k in text_conditions:
-            idx = _find_column_index(headers, k, [k])
+            idx = _find_column_index(headers, k, _condition_synonyms(k, aliases))
             if idx is not None:
                 used_indices.add(idx)
 
@@ -614,6 +892,14 @@ def query_tables(
             if len(candidates_cols) == 1:
                 final_target_col_idx = candidates_cols[0]
                 trace.append(f"自动推断目标列(排除杂项): {headers[final_target_col_idx]}")
+
+    if target_column and final_target_col_idx is None:
+        return {
+            "error": f"目标列未匹配: {target_column}",
+            "_table_name": table_name,
+            "_table_headers": headers,
+            "_trace": trace,
+        }
 
     # 构建返回值
     result: Dict[str, Any] = {}
