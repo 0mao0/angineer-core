@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.7
+
+- feat(citations): 引用集真相源上移到服务端——`run_end` payload 新增 `citations`（本轮实际参考的证据集，跨轮跨工具按 `target_id + marker` 去重），供宿主直接渲染「参考依据」，**不再依赖模型在正文照抄 `[K1]` 标记**（模型遵从是概率性的：同题两次一次 4 个标记、一次 0 个，旧做法会让出处整块消失）；新增公开函数 `aggregate_tool_citations`，作为引用集唯一装配点，`policy_query` 改为复用；标记只保留「句级定位挂不挂」的职责
+- docs: README 补 `run_end.payload.citations` 契约与宿主最小消费示例（含多库 `library_id` 回填、旧版本无该字段的兼容处理）
+
 ## 0.1.6
 
 - fix: agent 循环幻觉工具名熔断——模型连续 `ANGINEER_TOOL_HALLUCINATION_TURNS`（默认 2，0=关）轮调用的工具全部未注册时，直接转无工具直答收尾（reason=tool_hallucination_breaker），不再烧光轮次预算一题未答；轮内混入真实工具即清零计数、换段复位，不误伤正常重试
